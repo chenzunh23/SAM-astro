@@ -25,9 +25,26 @@ class ResizeLongestSide:
 
     def apply_image(self, image: np.ndarray) -> np.ndarray:
         """
-        Expects a numpy array with shape HxWxC in uint8 format.
+        Expects a numpy array with shape HxWxC. Supports `uint8` (0-255)
+        or floating-point arrays (e.g. original FITS floats). For uint8
+        we use PIL-backed resize for exact parity with previous behavior.
+        For float arrays we use torchvision's tensor resize path to avoid
+        converting through PIL and losing precision or requiring 0-255 mapping.
         """
         target_size = self.get_preprocess_shape(image.shape[0], image.shape[1], self.target_length)
+
+        # Preserve legacy PIL path for uint8 inputs to maintain exact parity.
+        if image.dtype == np.uint8:
+            return np.array(resize(to_pil_image(image), target_size))
+
+        if np.issubdtype(image.dtype, np.floating):
+            img_t = torch.as_tensor(image)
+            if img_t.ndim == 2:
+                img_t = img_t.unsqueeze(-1)
+            img_t = img_t.permute(2, 0, 1).contiguous()
+            resized_t = resize(img_t, target_size, antialias=True)
+            return resized_t.permute(1, 2, 0).cpu().numpy()
+
         return np.array(resize(to_pil_image(image), target_size))
 
     def apply_coords(self, coords: np.ndarray, original_size: Tuple[int, ...]) -> np.ndarray:

@@ -7,8 +7,9 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+import numpy as np
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .image_encoder import ImageEncoderViT
 from .mask_decoder import MaskDecoder
@@ -26,6 +27,10 @@ class Sam(nn.Module):
         mask_decoder: MaskDecoder,
         pixel_mean: List[float] = [123.675, 116.28, 103.53],
         pixel_std: List[float] = [58.395, 57.12, 57.375],
+        astro_preprocess_in_model: bool = False,
+        astro_preprocess_clip_sigma: float = 3.0,
+        astro_preprocess_sigma_iters: int = -1,
+        astro_preprocess_z_clip: Optional[Tuple[float, float]] = None,
     ) -> None:
         """
         SAM predicts object masks from an image and input prompts.
@@ -45,6 +50,10 @@ class Sam(nn.Module):
         self.mask_decoder = mask_decoder
         self.register_buffer("pixel_mean", torch.Tensor(pixel_mean).view(-1, 1, 1), False)
         self.register_buffer("pixel_std", torch.Tensor(pixel_std).view(-1, 1, 1), False)
+        self.astro_preprocess_in_model = bool(astro_preprocess_in_model)
+        self.astro_preprocess_clip_sigma = float(astro_preprocess_clip_sigma)
+        self.astro_preprocess_sigma_iters = int(astro_preprocess_sigma_iters)
+        self.astro_preprocess_z_clip = astro_preprocess_z_clip
 
     @property
     def device(self) -> Any:
@@ -163,8 +172,11 @@ class Sam(nn.Module):
 
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize pixel values and pad to a square input."""
-        # Normalize colors
-        x = (x - self.pixel_mean) / self.pixel_std
+        if self.astro_preprocess_in_model:
+            x = self.astro_preprocess(x)
+        else:
+            # Normalize colors
+            x = (x - self.pixel_mean) / self.pixel_std
 
         # Pad
         h, w = x.shape[-2:]
@@ -172,3 +184,73 @@ class Sam(nn.Module):
         padw = self.image_encoder.img_size - w
         x = F.pad(x, (0, padw, 0, padh))
         return x
+
+    def astro_preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-image astro normalization immediately before the image encoder."""
+        x = x.to(dtype=torch.float32)
+        squeeze_batch = x.ndim == 3
+        if squeeze_batch:
+            work = x.unsqueeze(0)
+        elif x.ndim == 4:
+            work = x
+        else:
+            raise ValueError(f"astro_preprocess expects CHW or BCHW input, got shape {tuple(x.shape)}")
+
+        out = torch.empty_like(work)
+        for b in range(work.shape[0]):
+            for c in range(work.shape[1]):
+                vals = work[b, c]
+                finite = torch.isfinite(vals)
+                if not bool(finite.any()):
+                    out[b, c] = torch.zeros_like(vals)
+                    continue
+
+                finite_vals = vals[finite]
+                raw_median = torch.median(finite_vals)
+                raw_sigma = torch.std(finite_vals, unbiased=False)
+                if not bool(torch.isfinite(raw_sigma)) or float(raw_sigma) <= 0.0:
+                    raw_sigma = torch.ones((), dtype=vals.dtype, device=vals.device)
+                # print(f'[DEBUG] astro preprocess clip sigma {self.astro_preprocess_clip_sigma} => clip_hi {raw_median + self.astro_preprocess_clip_sigma * raw_sigma:.6g}')
+                clip_hi = raw_median + self.astro_preprocess_clip_sigma * raw_sigma
+
+                clipped_vals = torch.minimum(finite_vals, clip_hi)
+                mean, std = self.astro_sigma_clipped_mean_std(clipped_vals, vals)
+                if not bool(torch.isfinite(std)) or float(std) <= 0.0:
+                    std = torch.ones((), dtype=vals.dtype, device=vals.device)
+
+                safe = torch.where(finite, vals, mean)
+                clipped = torch.minimum(safe, clip_hi)
+                z = (clipped - mean) / std
+                if self.astro_preprocess_z_clip is not None:
+                    z = torch.clamp(z, float(self.astro_preprocess_z_clip[0]), float(self.astro_preprocess_z_clip[1]))
+                out[b, c] = z
+
+        if squeeze_batch:
+            out = out[0]
+        return out
+
+    def astro_sigma_clipped_mean_std(
+        self,
+        clipped_vals: torch.Tensor,
+        like: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Astropy sigma_clipped_stats on a bright-clipped 1D tensor."""
+        try:
+            from astropy.stats import sigma_clipped_stats
+        except Exception as exc:
+            raise RuntimeError("astro_preprocess_in_model requires astropy for converged sigma-clipped stats.") from exc
+
+        arr = clipped_vals.detach().cpu().numpy().astype(np.float64, copy=False)
+        maxiters = None if self.astro_preprocess_sigma_iters < 0 else int(self.astro_preprocess_sigma_iters)
+        mean, _median, std = sigma_clipped_stats(
+            arr,
+            sigma=self.astro_preprocess_clip_sigma,
+            maxiters=maxiters,
+        )
+        if not np.isfinite(mean):
+            mean = float(np.nanmean(arr))
+        if not np.isfinite(std) or std <= 0:
+            std = float(np.nanstd(arr))
+        mean_t = torch.tensor(float(mean), dtype=like.dtype, device=like.device)
+        std_t = torch.tensor(float(std), dtype=like.dtype, device=like.device)
+        return mean_t, std_t

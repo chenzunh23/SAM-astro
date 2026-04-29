@@ -11,36 +11,96 @@ from functools import partial
 from .modeling import ImageEncoderViT, MaskDecoder, PromptEncoder, Sam, TwoWayTransformer
 
 
-def build_sam_vit_h(checkpoint=None):
+RGB_PIXEL_MEAN = [123.675, 116.28, 103.53]
+RGB_PIXEL_STD = [58.395, 57.12, 57.375]
+ASTRO_PIXEL_MEAN = [0.0, 0.0, 0.0]
+ASTRO_PIXEL_STD = [1.0, 1.0, 1.0]
+
+
+def build_sam_vit_h(
+    checkpoint=None,
+    scaling_mode=None,
+    astro_rgb_mode="none",
+    astro_rgb_low_sigma=None,
+    astro_rgb_none_std=None,
+    astro_preprocess_in_model=False,
+    astro_preprocess_clip_sigma=3.0,
+    astro_preprocess_sigma_iters=-1,
+    astro_preprocess_z_clip=None,
+):
     return _build_sam(
         encoder_embed_dim=1280,
         encoder_depth=32,
         encoder_num_heads=16,
         encoder_global_attn_indexes=[7, 15, 23, 31],
         checkpoint=checkpoint,
+        scaling_mode=scaling_mode,
+        astro_rgb_mode=astro_rgb_mode,
+        astro_rgb_low_sigma=astro_rgb_low_sigma,
+        astro_rgb_none_std=astro_rgb_none_std,
+        astro_preprocess_in_model=astro_preprocess_in_model,
+        astro_preprocess_clip_sigma=astro_preprocess_clip_sigma,
+        astro_preprocess_sigma_iters=astro_preprocess_sigma_iters,
+        astro_preprocess_z_clip=astro_preprocess_z_clip,
     )
 
 
 build_sam = build_sam_vit_h
 
 
-def build_sam_vit_l(checkpoint=None):
+def build_sam_vit_l(
+    checkpoint=None,
+    scaling_mode=None,
+    astro_rgb_mode="none",
+    astro_rgb_low_sigma=None,
+    astro_rgb_none_std=None,
+    astro_preprocess_in_model=False,
+    astro_preprocess_clip_sigma=3.0,
+    astro_preprocess_sigma_iters=-1,
+    astro_preprocess_z_clip=None,
+):
     return _build_sam(
         encoder_embed_dim=1024,
         encoder_depth=24,
         encoder_num_heads=16,
         encoder_global_attn_indexes=[5, 11, 17, 23],
         checkpoint=checkpoint,
+        scaling_mode=scaling_mode,
+        astro_rgb_mode=astro_rgb_mode,
+        astro_rgb_low_sigma=astro_rgb_low_sigma,
+        astro_rgb_none_std=astro_rgb_none_std,
+        astro_preprocess_in_model=astro_preprocess_in_model,
+        astro_preprocess_clip_sigma=astro_preprocess_clip_sigma,
+        astro_preprocess_sigma_iters=astro_preprocess_sigma_iters,
+        astro_preprocess_z_clip=astro_preprocess_z_clip,
     )
 
 
-def build_sam_vit_b(checkpoint=None):
+def build_sam_vit_b(
+    checkpoint=None,
+    scaling_mode=None,
+    astro_rgb_mode="none",
+    astro_rgb_low_sigma=None,
+    astro_rgb_none_std=None,
+    astro_preprocess_in_model=False,
+    astro_preprocess_clip_sigma=3.0,
+    astro_preprocess_sigma_iters=-1,
+    astro_preprocess_z_clip=None,
+):
     return _build_sam(
         encoder_embed_dim=768,
         encoder_depth=12,
         encoder_num_heads=12,
         encoder_global_attn_indexes=[2, 5, 8, 11],
         checkpoint=checkpoint,
+        scaling_mode=scaling_mode,
+        astro_rgb_mode=astro_rgb_mode,
+        astro_rgb_low_sigma=astro_rgb_low_sigma,
+        astro_rgb_none_std=astro_rgb_none_std,
+        astro_preprocess_in_model=astro_preprocess_in_model,
+        astro_preprocess_clip_sigma=astro_preprocess_clip_sigma,
+        astro_preprocess_sigma_iters=astro_preprocess_sigma_iters,
+        astro_preprocess_z_clip=astro_preprocess_z_clip,
     )
 
 
@@ -52,17 +112,80 @@ sam_model_registry = {
 }
 
 
+def convert_astro(mean, std, mode="astro_rgb", low_sigma=None):
+    if mode == "none":
+        return mean, std
+    elif mode == "astro_rgb":
+        new_mean = [(m + 3.0) * 255 / 6.0 for m in mean]
+        new_std = [s * 255 / 6.0 for s in std]
+        return new_mean, new_std
+    elif mode == "astro_rgb1":
+        new_mean = [(m + 1.0) * 255 / 4.0 for m in mean]
+        new_std = [s * 255 / 4.0 for s in std]
+        return new_mean, new_std
+    elif mode == "astro_rgb2":
+        low = 5.0 if low_sigma is None else float(low_sigma)
+        scale = low + 3.0
+        new_mean = [(m + low) * 255 / scale for m in mean]
+        new_std = [s * 255 / scale for s in std]
+        return new_mean, new_std
+    raise ValueError(f"Unknown astro_rgb_mode: {mode}")
+
+
+def get_pixel_stats(
+    scaling_mode=None,
+    astro_rgb_mode="none",
+    astro_rgb_low_sigma=None,
+    astro_rgb_none_std=None,
+):
+    if scaling_mode == "astro_rgb":
+        if astro_rgb_mode == "none":
+            std_value = 1.0 if astro_rgb_none_std is None else float(astro_rgb_none_std)
+            return ASTRO_PIXEL_MEAN, [std_value] * 3
+        return convert_astro(
+            ASTRO_PIXEL_MEAN,
+            ASTRO_PIXEL_STD,
+            mode=astro_rgb_mode,
+            low_sigma=astro_rgb_low_sigma,
+        )
+
+    if astro_rgb_mode != "none":
+        return convert_astro(
+            ASTRO_PIXEL_MEAN,
+            ASTRO_PIXEL_STD,
+            mode=astro_rgb_mode,
+            low_sigma=astro_rgb_low_sigma,
+        )
+
+    return RGB_PIXEL_MEAN, RGB_PIXEL_STD
+
+
 def _build_sam(
     encoder_embed_dim,
     encoder_depth,
     encoder_num_heads,
     encoder_global_attn_indexes,
     checkpoint=None,
+    scaling_mode=None,
+    astro_rgb_mode="none",
+    astro_rgb_low_sigma=None,
+    astro_rgb_none_std=None,
+    astro_preprocess_in_model=False,
+    astro_preprocess_clip_sigma=3.0,
+    astro_preprocess_sigma_iters=-1,
+    astro_preprocess_z_clip=None,
 ):
     prompt_embed_dim = 256
     image_size = 1024
     vit_patch_size = 16
     image_embedding_size = image_size // vit_patch_size
+    mean, std = get_pixel_stats(
+        scaling_mode=scaling_mode,
+        astro_rgb_mode=astro_rgb_mode,
+        astro_rgb_low_sigma=astro_rgb_low_sigma,
+        astro_rgb_none_std=astro_rgb_none_std,
+    )
+    print(f"Using SAM pixel normalization with mean={mean} and std={std}")
     sam = Sam(
         image_encoder=ImageEncoderViT(
             depth=encoder_depth,
@@ -96,8 +219,12 @@ def _build_sam(
             iou_head_depth=3,
             iou_head_hidden_dim=256,
         ),
-        pixel_mean=[123.675, 116.28, 103.53],
-        pixel_std=[58.395, 57.12, 57.375],
+        pixel_mean=mean,
+        pixel_std=std,
+        astro_preprocess_in_model=astro_preprocess_in_model,
+        astro_preprocess_clip_sigma=astro_preprocess_clip_sigma,
+        astro_preprocess_sigma_iters=astro_preprocess_sigma_iters,
+        astro_preprocess_z_clip=astro_preprocess_z_clip,
     )
     sam.eval()
     if checkpoint is not None:

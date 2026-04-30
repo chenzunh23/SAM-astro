@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "results" / "zangetsu_small_sigmaclip_sex"
+DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "results" / "zangetsu_small_sigmaclip_sex_no_clip"
 DEFAULT_CASES = ("denoised", "noisy")
 DEFAULT_MODES = ("mode_none", "mode_astro_rgb")
 BAR_LABELS = ("SExtractor", "SAM none") #,"SAM astro_rgb"

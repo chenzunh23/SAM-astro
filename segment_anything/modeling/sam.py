@@ -187,6 +187,7 @@ class Sam(nn.Module):
 
     def astro_preprocess(self, x: torch.Tensor) -> torch.Tensor:
         """Per-image astro normalization immediately before the image encoder."""
+        # print(f'[DEBUG] Running astro_preprocess_in_model with clip_sigma={self.astro_preprocess_clip_sigma}, sigma_iters={self.astro_preprocess_sigma_iters}, z_clip={self.astro_preprocess_z_clip}')
         x = x.to(dtype=torch.float32)
         squeeze_batch = x.ndim == 3
         if squeeze_batch:

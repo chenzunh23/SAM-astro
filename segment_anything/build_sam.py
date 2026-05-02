@@ -230,5 +230,22 @@ def _build_sam(
     if checkpoint is not None:
         with open(checkpoint, "rb") as f:
             state_dict = torch.load(f)
-        sam.load_state_dict(state_dict)
+        # Deal with torch.compile
+        try:
+            sam.load_state_dict(state_dict)
+        except Exception:
+            # Add _orig_mod to state dict keys to load into compiled modules
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith("image_encoder."):
+                    new_k = k.replace("image_encoder.", "image_encoder._orig_mod.")
+                elif k.startswith("prompt_encoder."):
+                    new_k = k.replace("prompt_encoder.", "prompt_encoder._orig_mod.")
+                elif k.startswith("mask_decoder."):
+                    new_k = k.replace("mask_decoder.", "mask_decoder._orig_mod.")
+                else:
+                    new_k = k
+                new_state_dict[new_k] = v
+            torch.set_float32_matmul_precision("high")
+            sam.load_state_dict(new_state_dict)
     return sam

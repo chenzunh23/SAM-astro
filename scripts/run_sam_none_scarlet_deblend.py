@@ -97,11 +97,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-source-area", type=int, default=8)
     parser.add_argument("--min-source-snr", type=float, default=2.0)
     parser.add_argument("--mask-padding", type=int, default=2)
+    parser.add_argument("--blend-init-sigma", type=float, default=3.0)
     parser.add_argument(
         "--source-mode",
-        choices=["extended", "mask"],
+        choices=["extended", "mask", "blend"],
         default="extended",
-        help="extended uses SAM masks only for source centers; mask uses hard SAM morphology support",
+        help=(
+            "extended uses SAM masks only for source centers; mask uses hard per-source SAM supports; "
+            "blend uses each SAM mask as a parent blend region and initializes multiple sources inside it"
+        ),
     )
     parser.add_argument("--display-percentiles", type=float, nargs=2, default=[1.0, 99.0])
     return parser.parse_args()
@@ -391,6 +395,79 @@ def make_mask_sources(
     return sources
 
 
+def make_blend_sources(
+    model_frame,
+    observation,
+    label_map: np.ndarray,
+    detection: np.ndarray,
+    threshold_sigma: float,
+    min_distance: int,
+    max_peaks_per_mask: int,
+    max_sources: int,
+    min_source_area: int,
+    min_source_snr: float,
+    padding: int,
+    init_sigma: float,
+) -> list:
+    """Initialize multiple sources inside each SAM parent mask without hard child boundaries."""
+
+    sources = []
+    noise_rms = np.asarray(np.mean(observation.noise_rms, axis=(1, 2)))
+    yy, xx = np.indices(label_map.shape)
+    sigma2 = max(float(init_sigma), 1e-3) ** 2
+
+    for label in np.unique(label_map):
+        if label <= 0:
+            continue
+        parent_mask = label_map == label
+        if np.count_nonzero(parent_mask) < min_source_area:
+            continue
+        if mask_snr(parent_mask, detection) < min_source_snr:
+            continue
+
+        centers = peaks_in_mask(parent_mask, detection, threshold_sigma, min_distance, max_peaks_per_mask)
+        if not centers:
+            continue
+
+        bbox = scarlet.Box.from_data(parent_mask.astype(np.float32), min_value=0)
+        if padding > 0:
+            bbox = bbox.grow(padding)
+        parent_cut = bbox.extract_from(parent_mask.astype(np.float32)).astype(bool)
+        det_cut = bbox.extract_from(np.clip(detection, 0, None))
+        yy_cut = bbox.extract_from(yy)
+        xx_cut = bbox.extract_from(xx)
+
+        for center in centers:
+            if len(sources) >= max_sources:
+                return sources
+
+            cy, cx = center
+            seed = np.exp(-0.5 * ((yy_cut - cy) ** 2 + (xx_cut - cx) ** 2) / sigma2)
+            morph = det_cut * seed * parent_cut
+            if np.max(morph) <= 0:
+                morph = seed * parent_cut
+            if np.max(morph) <= 0:
+                continue
+            morph = morph / np.max(morph)
+
+            spectrum_values = source_spectrum_from_morph(observation, bbox, morph)
+            spectrum = scarlet.TabulatedSpectrum(model_frame, spectrum_values, min_step=noise_rms)
+            constraint = scarlet.ConstraintChain(
+                scarlet.PositivityConstraint(),
+                MaskConstraint(parent_cut),
+                scarlet.NormalizationConstraint("max"),
+            )
+            parameter = scarlet.Parameter(morph, name="image", step=1e-2, constraint=constraint)
+            morphology = scarlet.ImageMorphology(model_frame, parameter, bbox=bbox, resizing=False)
+            source = scarlet.FactorizedComponent(model_frame, spectrum, morphology)
+            source.center = np.asarray(center, dtype=float)
+            sources.append(source)
+
+    if not sources:
+        raise RuntimeError("No scarlet sources could be initialized from SAM blend regions")
+    return sources
+
+
 def make_sources(model_frame, observation, centers: Sequence[Tuple[float, float]], thresh: float, min_snr: float) -> list:
     sources, skipped = scarlet.initialization.init_all_sources(
         model_frame,
@@ -461,6 +538,34 @@ def save_deblend_figure(
         ax.set_title(title, fontsize=12, pad=6)
         ax.set_axis_off()
     fig.savefig(output, dpi=180, bbox_inches="tight", pad_inches=0.08)
+    plt.close(fig)
+
+
+def save_likelihood_curve(blend, output_dir: Path) -> None:
+    log_likelihood = np.asarray(blend.log_likelihood, dtype=np.float64)
+    if log_likelihood.size == 0:
+        print("[WARN] No scarlet log-likelihood values were recorded")
+        return
+
+    iterations = np.arange(log_likelihood.size, dtype=int)
+    csv_data = np.column_stack([iterations, log_likelihood])
+    np.savetxt(
+        output_dir / "scarlet_log_likelihood.csv",
+        csv_data,
+        delimiter=",",
+        header="iteration,log_likelihood",
+        comments="",
+    )
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    ax.plot(iterations, log_likelihood, color="#2f5f8f", linewidth=1.8)
+    ax.scatter(iterations[-1], log_likelihood[-1], color="#c43c39", s=28, zorder=3)
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("log-Likelihood")
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(output_dir / "scarlet_log_likelihood.png", dpi=180)
+    fig.savefig(output_dir / "scarlet_log_likelihood.tif")
     plt.close(fig)
 
 
@@ -573,12 +678,29 @@ def main() -> None:
             args.mask_padding,
         )
         print(f"[scarlet] mask-constrained sources={len(sources)}")
+    elif args.source_mode == "blend":
+        sources = make_blend_sources(
+            model_frame,
+            observation,
+            label_map,
+            detection,
+            args.peak_threshold,
+            args.peak_min_distance,
+            args.max_peaks_per_mask,
+            args.max_sources,
+            args.min_source_area,
+            args.min_source_snr,
+            args.mask_padding,
+            args.blend_init_sigma,
+        )
+        print(f"[scarlet] blend-region sources={len(sources)}")
     else:
         sources = make_sources(model_frame, observation, centers, args.source_thresh, args.scarlet_min_snr)
         print(f"[scarlet] extended sources={len(sources)}")
     blend = scarlet.Blend(sources, observation)
     it, log_l = blend.fit(args.iterations, e_rel=args.e_rel)
     print(f"[scarlet] iterations={it} logL={log_l}")
+    save_likelihood_curve(blend, args.output_dir)
 
     model = blend.get_model()
     rendered = observation.render(model)
@@ -616,6 +738,34 @@ def main() -> None:
             pickle.dump(sources, f)
     except Exception as exc:
         print(f"[WARN] Could not pickle scarlet sources: {exc}")
+
+    # Write scarlet configuration and runtime summary into the output dir
+    try:
+        scarlet_cfg = {
+            "sam_config": sam_config,
+            "scarlet": {
+                "psf_sigma": list(sigma_vals),
+                "variance": float(args.variance),
+                "channels": list(model_frame.channels),
+                "model_frame_shape": list(cube.shape),
+                "weights_shape": list(weights.shape),
+                "source_mode": args.source_mode,
+                "centers": [[float(y), float(x)] for (y, x) in centers],
+                "n_centers": len(centers),
+                "n_sources": len(sources) if 'sources' in locals() else None,
+                "scarlet_params": {
+                    "iterations_requested": int(args.iterations),
+                    "iterations_run": int(it) if 'it' in locals() else None,
+                    "e_rel": float(args.e_rel),
+                    "scarlet_min_snr": float(args.scarlet_min_snr),
+                },
+                "log_likelihood": float(log_l) if 'log_l' in locals() else None,
+            },
+        }
+        (args.output_dir / "scarlet_config.json").write_text(json.dumps(scarlet_cfg, indent=2), encoding="utf-8")
+        print(f"[INFO] Wrote scarlet configuration to {(args.output_dir / 'scarlet_config.json')}")
+    except Exception as exc:
+        print(f"[WARN] Could not write scarlet_config.json to output directory: {exc}")
 
 
 if __name__ == "__main__":

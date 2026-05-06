@@ -4,6 +4,7 @@ import argparse
 import csv
 import math
 import pickle
+import re
 from pathlib import Path
 from typing import Any
 
@@ -12,8 +13,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.patches import Rectangle
 import numpy as np
 from astropy.io import fits
+from astropy.visualization import ZScaleInterval
 
 
 def _load_catalog(path: Path):
@@ -23,12 +26,24 @@ def _load_catalog(path: Path):
     return afwTable.SourceCatalog.readFits(str(path))
 
 
+def _safe_name(value: str) -> str:
+    value = value.strip() or "root"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_").lower() or "item"
+
+
 def _read_exposure_image(path: Path):
     import lsst.afw.image as afwImage
 
     exposure = afwImage.ExposureF(str(path))
     bbox = exposure.getBBox()
     return exposure, exposure.image.array.astype(np.float32), int(bbox.getMinX()), int(bbox.getMinY())
+
+
+def _is_sky_source(record) -> bool:
+    try:
+        return bool(record["merge_footprint_sky"])
+    except Exception:
+        return False
 
 
 def _asinh_scale(image: np.ndarray, q: float = 8.0) -> np.ndarray:
@@ -41,6 +56,20 @@ def _asinh_scale(image: np.ndarray, q: float = 8.0) -> np.ndarray:
     x = np.clip((image - lo) / (hi - lo), 0, None)
     y = np.arcsinh(q * x) / np.arcsinh(q)
     return np.clip(np.nan_to_num(y), 0, 1).astype(np.float32)
+
+
+def _zscale_image(image: np.ndarray) -> np.ndarray:
+    finite = image[np.isfinite(image)]
+    if finite.size == 0:
+        return np.zeros_like(image, dtype=np.float32)
+    try:
+        vmin, vmax = ZScaleInterval().get_limits(finite)
+    except Exception:
+        vmin, vmax = np.percentile(finite, [0.5, 99.5])
+    if not np.isfinite(vmax - vmin) or vmax <= vmin:
+        vmax = vmin + 1.0
+    scaled = (image - vmin) / (vmax - vmin)
+    return np.clip(np.nan_to_num(scaled), 0, 1).astype(np.float32)
 
 
 def _make_rgb(band_images: dict[str, np.ndarray]) -> np.ndarray:
@@ -66,6 +95,8 @@ def _paint_catalog(catalog, shape: tuple[int, int], min_x: int, min_y: int):
     child_mask = np.zeros(shape, dtype=np.int16)
     peaks = np.zeros(shape, dtype=np.int16)
     for record in catalog:
+        if _is_sky_source(record):
+            continue
         footprint = record.getFootprint()
         if footprint is None:
             continue
@@ -101,10 +132,14 @@ def _overlay_mask(rgb: np.ndarray, mask: np.ndarray, color=(1.0, 0.1, 0.1), alph
 
 def _paint_label_catalog(catalog, shape: tuple[int, int], min_x: int, min_y: int) -> np.ndarray:
     label_map = np.zeros(shape, dtype=np.int32)
-    for label, record in enumerate(catalog, start=1):
+    label = 0
+    for record in catalog:
+        if _is_sky_source(record):
+            continue
         footprint = record.getFootprint()
         if footprint is None:
             continue
+        label += 1
         for span in footprint.spans:
             y = int(span.getY()) - min_y
             x0 = int(span.getX0()) - min_x
@@ -115,6 +150,40 @@ def _paint_label_catalog(catalog, shape: tuple[int, int], min_x: int, min_y: int
                 if xs0 <= xs1:
                     label_map[y, xs0 : xs1 + 1] = label
     return label_map
+
+
+def _catalog_mask_and_bboxes(catalog, shape: tuple[int, int], min_x: int, min_y: int):
+    mask = np.zeros(shape, dtype=np.int16)
+    bboxes: list[tuple[int, int, int, int]] = []
+    peaks: list[tuple[float, float]] = []
+    for record in catalog:
+        if _is_sky_source(record):
+            continue
+        footprint = record.getFootprint()
+        if footprint is None:
+            continue
+        bbox = footprint.getBBox()
+        bx0 = int(bbox.getMinX()) - min_x
+        by0 = int(bbox.getMinY()) - min_y
+        bx1 = int(bbox.getMaxX()) - min_x
+        by1 = int(bbox.getMaxY()) - min_y
+        if bx1 >= 0 and by1 >= 0 and bx0 < shape[1] and by0 < shape[0]:
+            bboxes.append((max(0, bx0), max(0, by0), min(shape[1] - 1, bx1), min(shape[0] - 1, by1)))
+        for span in footprint.spans:
+            y = int(span.getY()) - min_y
+            x0 = int(span.getX0()) - min_x
+            x1 = int(span.getX1()) - min_x
+            if 0 <= y < shape[0]:
+                xs0 = max(0, x0)
+                xs1 = min(shape[1] - 1, x1)
+                if xs0 <= xs1:
+                    mask[y, xs0 : xs1 + 1] = 1
+        for peak in footprint.getPeaks():
+            x = float(peak.getFx()) - min_x
+            y = float(peak.getFy()) - min_y
+            if 0 <= x < shape[1] and 0 <= y < shape[0]:
+                peaks.append((x, y))
+    return mask, bboxes, peaks
 
 
 def _overlay_labels(rgb: np.ndarray, label_map: np.ndarray, alpha: float = 0.42) -> np.ndarray:
@@ -138,11 +207,15 @@ def _record_by_id(catalog) -> dict[int, Any]:
 def _leaf_records(catalog):
     child_counts: dict[int, int] = {}
     for record in catalog:
+        if _is_sky_source(record):
+            continue
         parent = int(record["parent"])
         if parent != 0:
             child_counts[parent] = child_counts.get(parent, 0) + 1
     leaves = []
     for record in catalog:
+        if _is_sky_source(record):
+            continue
         rec_id = int(record.getId())
         parent = int(record["parent"])
         if parent != 0 or child_counts.get(rec_id, 0) == 0:
@@ -192,6 +265,8 @@ def _science_leaf_records(catalog, min_x: int, min_y: int, shape: tuple[int, int
     _, child_counts = _leaf_records(catalog)
     science = []
     for record in catalog:
+        if _is_sky_source(record):
+            continue
         if _record_n_child(record, child_counts, catalog.schema) != 0:
             continue
         x, y = _bounded_peak_xy(record, catalog.schema, min_x, min_y, shape)
@@ -258,6 +333,9 @@ def export_source_panels(
                 break
             cube, spectrum, origin = _source_model(source, len(bands))
             rec = records.get(int(source_id))
+            parent_rec = records.get(int(parent_id))
+            if (rec is not None and _is_sky_source(rec)) or (parent_rec is not None and _is_sky_source(parent_rec)):
+                continue
             parent = int(rec["parent"]) if rec is not None else int(parent_id)
             origin_y, origin_x = int(origin[0]), int(origin[1])
             width, height = int(cube.shape[2]), int(cube.shape[1])
@@ -353,6 +431,8 @@ def _plot_source_markers(
     child_x = []
     child_y = []
     for record in records:
+        if _is_sky_source(record):
+            continue
         x, y = _bounded_peak_xy(record, schema, min_x, min_y, shape)
         if not np.isfinite(x) or not np.isfinite(y):
             continue
@@ -391,6 +471,8 @@ def export_visual_checks(
     parent_anchor_x = []
     parent_anchor_y = []
     for record in deblend_catalog:
+        if _is_sky_source(record):
+            continue
         if int(record["parent"]) != 0 or _record_n_child(record, child_counts, deblend_catalog.schema) <= 1:
             continue
         x, y = _peak_xy(record, deblend_catalog.schema, prefer_deblend=False)
@@ -423,7 +505,9 @@ def export_visual_checks(
     complex_parents = [
         record
         for record in deblend_catalog
-        if int(record["parent"]) == 0 and _record_n_child(record, child_counts, deblend_catalog.schema) > 1
+        if not _is_sky_source(record)
+        and int(record["parent"]) == 0
+        and _record_n_child(record, child_counts, deblend_catalog.schema) > 1
     ]
     complex_parents = sorted(
         complex_parents,
@@ -473,6 +557,8 @@ def export_merge_regions(merge_catalog, rgb: np.ndarray, min_x: int, min_y: int,
     outdir.mkdir(parents=True, exist_ok=True)
     summary_rows = []
     for record in merge_catalog:
+        if _is_sky_source(record):
+            continue
         parent_id = int(record.getId())
         single_mask, _, _, peaks = _paint_catalog([record], rgb.shape[:2], min_x, min_y)
         fits.writeto(outdir / f"merge_parent_{parent_id:08d}_mask.fits", single_mask.astype(np.int16), overwrite=True)
@@ -489,6 +575,197 @@ def export_merge_regions(merge_catalog, rgb: np.ndarray, min_x: int, min_y: int,
     with (outdir / "merge_regions.csv").open("w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["parent_id", "mask_area", "n_peaks"])
+        writer.writerows(summary_rows)
+
+
+def _overlay_mask_on_gray(gray: np.ndarray, mask: np.ndarray, alpha: float = 0.42) -> np.ndarray:
+    out = np.dstack([gray, gray, gray]).astype(np.float32)
+    if np.count_nonzero(mask) == 0:
+        return out
+    values = np.unique(mask)
+    values = values[values != 0]
+    if values.size <= 1:
+        m = mask != 0
+        color = np.asarray([1.0, 0.12, 0.05], dtype=np.float32)
+        out[m] = (1 - alpha) * out[m] + alpha * color
+        return np.clip(out, 0, 1)
+
+    cmap = plt.get_cmap("tab20", 20)
+    for value in values:
+        m = mask == value
+        color = np.asarray(cmap((int(value) - 1) % 20)[:3], dtype=np.float32)
+        out[m] = (1 - alpha) * out[m] + alpha * color
+    return np.clip(out, 0, 1)
+
+
+def _candidate_image_mask_hdus(path: Path, shape: tuple[int, int]):
+    products = []
+    with fits.open(path, memmap=False) as hdul:
+        for index, hdu in enumerate(hdul):
+            data = hdu.data
+            if data is None:
+                continue
+            array = np.asarray(data)
+            if array.ndim < 2:
+                continue
+            if array.ndim > 2:
+                array = array.reshape((-1, array.shape[-2], array.shape[-1]))[0]
+            if array.shape != shape:
+                continue
+
+            hdu_name = str(hdu.name or f"HDU{index}").upper()
+            path_name = path.name.upper()
+            looks_like_mask = (
+                "MASK" in hdu_name
+                or "MASK" in path_name
+                or "LABELMAP" in path_name
+                or "LABEL" in hdu_name
+            )
+            if not looks_like_mask:
+                continue
+
+            mask = np.nan_to_num(array)
+            if np.issubdtype(mask.dtype, np.floating):
+                mask = mask != 0
+            products.append((hdu.name or f"HDU{index}", mask.astype(np.int32)))
+    return products
+
+
+def _save_zscale_overlay(
+    outpath: Path,
+    gray: np.ndarray,
+    title: str,
+    *,
+    mask: np.ndarray | None = None,
+    bboxes: list[tuple[int, int, int, int]] | None = None,
+    peaks: list[tuple[float, float]] | None = None,
+    note: str | None = None,
+) -> None:
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(10, 10), constrained_layout=True)
+    if mask is not None and np.count_nonzero(mask):
+        ax.imshow(_overlay_mask_on_gray(gray, mask), origin="lower")
+    else:
+        ax.imshow(gray, origin="lower", cmap="gray", vmin=0, vmax=1)
+
+    if bboxes:
+        for x0, y0, x1, y1 in bboxes:
+            ax.add_patch(
+                Rectangle(
+                    (x0, y0),
+                    max(1, x1 - x0 + 1),
+                    max(1, y1 - y0 + 1),
+                    fill=False,
+                    edgecolor="#39d5ff",
+                    linewidth=0.8,
+                    alpha=0.85,
+                )
+            )
+    if peaks:
+        x = [p[0] for p in peaks]
+        y = [p[1] for p in peaks]
+        ax.scatter(x, y, s=14, c="#ffd34d", marker="+", linewidths=0.8)
+    if note:
+        ax.text(
+            0.02,
+            0.02,
+            note,
+            transform=ax.transAxes,
+            color="white",
+            fontsize=9,
+            va="bottom",
+            bbox={"facecolor": "black", "alpha": 0.55, "edgecolor": "none", "pad": 3},
+        )
+    ax.set_title(title, fontsize=10)
+    ax.set_xlabel("local x")
+    ax.set_ylabel("local y")
+    fig.savefig(outpath, dpi=144)
+    plt.close(fig)
+
+
+def export_zscale_mask_overlays(root: Path, hsc_i_image: np.ndarray, min_x: int, min_y: int, outdir: Path) -> None:
+    outdir.mkdir(parents=True, exist_ok=True)
+    gray = _zscale_image(hsc_i_image)
+    shape = gray.shape
+    fits_files = sorted(root.rglob("*.fits"))
+    # Filter out files produced by the visualization (in "merge_regions/" directory) to avoid confusion.
+    fits_files = [f for f in fits_files if not f.parts[-2] == "merge_regions"]
+    summary_rows = []
+
+    catalog_names = {"deepCoadd_det.fits", "deepCoadd_mergeDet.fits", "deepCoadd_deblendedFlux.fits"}
+    for path in fits_files:
+        rel = path.relative_to(root)
+        base = _safe_name("__".join(rel.with_suffix("").parts))
+        wrote = 0
+
+        if path.name in catalog_names:
+            try:
+                catalog = _load_catalog(path)
+                mask, bboxes, peaks = _catalog_mask_and_bboxes(catalog, shape, min_x, min_y)
+                use_bboxes = bboxes if np.count_nonzero(mask) == 0 else []
+                note = f"{rel}\nrecords={len(catalog)} mask_pixels={int(np.count_nonzero(mask))}"
+                if np.count_nonzero(mask) == 0 and bboxes:
+                    note += "\nno footprint spans; showing bbox"
+                _save_zscale_overlay(
+                    outdir / f"{base}.png",
+                    gray,
+                    str(rel),
+                    mask=mask,
+                    bboxes=use_bboxes,
+                    peaks=peaks,
+                    note=note,
+                )
+                summary_rows.append([str(rel), "catalog", int(np.count_nonzero(mask)), len(bboxes), len(peaks), f"{base}.png"])
+                wrote += 1
+            except Exception as exc:
+                _save_zscale_overlay(
+                    outdir / f"{base}.png",
+                    gray,
+                    str(rel),
+                    note=f"{rel}\ncatalog read failed: {type(exc).__name__}: {exc}",
+                )
+                summary_rows.append([str(rel), "catalog_error", 0, 0, 0, f"{base}.png"])
+                wrote += 1
+
+        if wrote == 0:
+            image_masks = []
+            try:
+                image_masks = _candidate_image_mask_hdus(path, shape)
+            except Exception as exc:
+                _save_zscale_overlay(
+                    outdir / f"{base}.png",
+                    gray,
+                    str(rel),
+                    note=f"{rel}\nFITS read failed: {type(exc).__name__}: {exc}",
+                )
+                summary_rows.append([str(rel), "fits_error", 0, 0, 0, f"{base}.png"])
+                wrote += 1
+
+            for hdu_name, mask in image_masks:
+                suffix = _safe_name(str(hdu_name))
+                outname = f"{base}__{suffix}.png" if len(image_masks) > 1 else f"{base}.png"
+                _save_zscale_overlay(
+                    outdir / outname,
+                    gray,
+                    f"{rel} [{hdu_name}]",
+                    mask=mask,
+                    note=f"{rel}\nHDU={hdu_name} mask_pixels={int(np.count_nonzero(mask))}",
+                )
+                summary_rows.append([str(rel), f"image_hdu:{hdu_name}", int(np.count_nonzero(mask)), 0, 0, outname])
+                wrote += 1
+
+        if wrote == 0:
+            _save_zscale_overlay(
+                outdir / f"{base}.png",
+                gray,
+                str(rel),
+                note=f"{rel}\nno mask-like HDU or LSST footprint catalog found",
+            )
+            summary_rows.append([str(rel), "none", 0, 0, 0, f"{base}.png"])
+
+    with (outdir / "zscale_mask_overlays.csv").open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["fits_path", "overlay_type", "mask_pixels", "bbox_count", "peak_count", "png"])
         writer.writerows(summary_rows)
 
 
@@ -540,6 +817,8 @@ def main() -> None:
         outdir / "visual_check",
     )
     export_merge_regions(merge_catalog, rgb, int(min_x), int(min_y), outdir / "merge_regions")
+    hsc_i_image = band_images.get("i", next(iter(band_images.values())))
+    export_zscale_mask_overlays(root, hsc_i_image, int(min_x), int(min_y), outdir / "zscale_mask_overlays")
     print(f"Wrote visualizations under: {outdir}")
 
 

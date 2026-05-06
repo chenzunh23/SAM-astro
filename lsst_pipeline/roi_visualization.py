@@ -205,6 +205,16 @@ def _archive_rows_by_id(archive_index: np.ndarray, *, cat_archive: int, persista
     return rows
 
 
+def _is_sky_source_row(row) -> bool:
+    names = getattr(getattr(row, "dtype", None), "names", None)
+    if names is None or "merge_footprint_sky" not in names:
+        return False
+    try:
+        return bool(row["merge_footprint_sky"])
+    except Exception:
+        return False
+
+
 def _load_layers_from_merge_catalog(
     path: Path,
     shape: tuple[int, int],
@@ -223,6 +233,8 @@ def _load_layers_from_merge_catalog(
         footprint_rows = _archive_rows_by_id(archive_index, cat_archive=1, persistable=0)
         spanset_rows = _archive_rows_by_id(archive_index, cat_archive=2, persistable=0)
         for source in sources:
+            if _is_sky_source_row(source):
+                continue
             if "parent" in sources.dtype.names and int(source["parent"]) != 0:
                 continue
             parent_id = int(source["id"])

@@ -61,6 +61,13 @@ def _load_lsst_reference_bbox(reference_calexp: Path):
     return bbox, int(bbox.getWidth()), int(bbox.getHeight()), int(bbox.getMinX()), int(bbox.getMinY())
 
 
+def _is_sky_source(record) -> bool:
+    try:
+        return bool(record["merge_footprint_sky"])
+    except Exception:
+        return False
+
+
 def _paint_footprints_with_lsst(path: Path, root: Path, outdir: Path) -> list[Path]:
     import lsst.afw.image as afwImage
     import lsst.afw.table as afwTable
@@ -81,6 +88,8 @@ def _paint_footprints_with_lsst(path: Path, root: Path, outdir: Path) -> list[Pa
 
     has_parent = "parent" in catalog.schema
     for record in catalog:
+        if _is_sky_source(record):
+            continue
         footprint = record.getFootprint()
         if footprint is None:
             continue

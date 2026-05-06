@@ -91,10 +91,23 @@ def _filter_band_label(exposure) -> str:
 
 def _catalog_summary(catalog) -> dict[str, int]:
     parent = catalog["parent"] if "parent" in catalog.schema else []
+    if len(parent) == 0:
+        return {"row_count": int(len(catalog)), "parent_zero_count": 0,
+"child_count": 0}
+
+    is_sky = []
+    for record in catalog:
+        try:
+            is_sky.append(bool(record["merge_footprint_sky"]))
+        except Exception:
+            is_sky.append(False)
+
+    science = [not v for v in is_sky]
     return {
-        "row_count": int(len(catalog)),
-        "parent_zero_count": int(sum(int(value) == 0 for value in parent)),
-        "child_count": int(sum(int(value) != 0 for value in parent)),
+        "row_count": int(sum(science)),
+        "sky_count": int(sum(is_sky)),
+        "parent_zero_count": int(sum(int(p) == 0 and keep for p, keep in zip(parent,science))),
+        "child_count": int(sum(int(p) != 0 and keep for p, keep in zip(parent,science))),
     }
 
 
@@ -569,9 +582,16 @@ def run_demo(
         band_label_by_name: dict[str, str] = {}
         detect_outputs: dict[str, Any] = {}
 
+        lsst_config = DetectCoaddSourcesTask.ConfigClass()
+        # lsst_config.detection.thresholdValue = 8.0 # Default 5.0
+        # lsst_config.detection.minPixels = 15 # Accounting for seeing and resampling, default is 5
+        # lsst_config.detection.nSigmaToGrow = 0.5
+        # lsst_config.detection.returnOriginalFootprint = True
+        # lsst_config.detection.combinedGrow = False
+
         for band_name, exposure_path in coadds:
             exposure = afwImage.ExposureF(str(exposure_path))
-            detect_task = DetectCoaddSourcesTask(config=DetectCoaddSourcesTask.ConfigClass())
+            detect_task = DetectCoaddSourcesTask(config=lsst_config)
             detect_result = detect_task.run(
                 exposure=exposure,
                 idFactory=afwTable.IdFactory.makeSimple(),

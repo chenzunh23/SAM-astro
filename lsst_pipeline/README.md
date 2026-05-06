@@ -26,7 +26,7 @@ footprint，然后继续使用 LSST 的 merge 和 scarlet deblend。
 
 ## 环境准备
 
-不要直接用普通系统 Python 跑主流程。需要先加载 LSST Science Pipelines：
+不要直接用普通系统 Python 跑主流程。需要先加载 LSST Science Pipelines ([v_29_2_1](https://pipelines.lsst.io/install/lsstinstall.html))：
 
 ```bash
 source loadLSST.sh
@@ -44,12 +44,12 @@ scripts/amg_fits_core.py
 ```bash
 python scarlet_deblend_from_fits.py \
   --detection-mode lsst \
-  --repo input/repo \
+  --repo fits/repo \
   --tract 9813 \
   --patch 4,5 \
-  --coadd HSC-G=input/projection_cutout/HSC-G/deepCoadd-HSC-G-9813-4,5.fits \
-  --coadd HSC-R=input/projection_cutout/HSC-R/deepCoadd-HSC-R-9813-4,5.fits \
-  --coadd HSC-I=input/projection_cutout/HSC-I/deepCoadd-HSC-I-9813-4,5.fits \
+  --coadd HSC-G=fits/projection_cutout/HSC-G/deepCoadd-HSC-G-9813-4,5.fits \
+  --coadd HSC-R=fits/projection_cutout/HSC-R/deepCoadd-HSC-R-9813-4,5.fits \
+  --coadd HSC-I=fits/projection_cutout/HSC-I/deepCoadd-HSC-I-9813-4,5.fits \
   --clip-sky-sources-to-exposure-bbox \
   --output-dir output/lsst_run
 ```
@@ -60,12 +60,12 @@ python scarlet_deblend_from_fits.py \
 python scarlet_deblend_from_fits.py \
   --detection-mode sam \
   --sam-repo /path/to/segment-anything \
-  --repo input/repo \
+  --repo fits/repo \
   --tract 9813 \
   --patch 4,5 \
-  --coadd HSC-G=input/projection_cutout/HSC-G/deepCoadd-HSC-G-9813-4,5.fits \
-  --coadd HSC-R=input/projection_cutout/HSC-R/deepCoadd-HSC-R-9813-4,5.fits \
-  --coadd HSC-I=input/projection_cutout/HSC-I/deepCoadd-HSC-I-9813-4,5.fits \
+  --coadd HSC-G=fits/projection_cutout/HSC-G/deepCoadd-HSC-G-9813-4,5.fits \
+  --coadd HSC-R=fits/projection_cutout/HSC-R/deepCoadd-HSC-R-9813-4,5.fits \
+  --coadd HSC-I=fits/projection_cutout/HSC-I/deepCoadd-HSC-I-9813-4,5.fits \
   --clip-sky-sources-to-exposure-bbox \
   --output-dir output/sam_run
 ```

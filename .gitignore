@@ -44,6 +44,10 @@ package-lock.json
 # Results
 results/
 *.fits
-*outputs*/*
+*/*output*/*
+*outputs*/
 amg_astro*
 testing*/
+
+# FITS
+lsst_pipeline/fits/

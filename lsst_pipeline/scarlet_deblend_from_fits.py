@@ -92,8 +92,7 @@ def _filter_band_label(exposure) -> str:
 def _catalog_summary(catalog) -> dict[str, int]:
     parent = catalog["parent"] if "parent" in catalog.schema else []
     if len(parent) == 0:
-        return {"row_count": int(len(catalog)), "parent_zero_count": 0,
-"child_count": 0}
+        return {"row_count": int(len(catalog)), "parent_zero_count": 0,"child_count": 0}
 
     is_sky = []
     for record in catalog:
@@ -584,10 +583,12 @@ def run_demo(
 
         lsst_config = DetectCoaddSourcesTask.ConfigClass()
         # lsst_config.detection.thresholdValue = 8.0 # Default 5.0
-        # lsst_config.detection.minPixels = 15 # Accounting for seeing and resampling, default is 5
-        # lsst_config.detection.nSigmaToGrow = 0.5
-        # lsst_config.detection.returnOriginalFootprint = True
-        # lsst_config.detection.combinedGrow = False
+        lsst_config.detection.minPixels = 15 # Accounting for seeing and resampling, default is 1
+        # In lsst-scipipe-10.1.0, combinedGrow=False enters a Python loop over
+        # FootprintSet, but that binding is not iterable.  Use no grow here:
+        # it also avoids reconnecting nearby detections on denoised cutouts.
+        # lsst_config.detection.nSigmaToGrow = 0.5 # Default 2.4
+        # lsst_config.detection.returnOriginalFootprints = True
 
         for band_name, exposure_path in coadds:
             exposure = afwImage.ExposureF(str(exposure_path))

@@ -1,3 +1,12 @@
+"""Evaluate source detection quality by centroid matching.
+
+The metric is a one-to-one nearest-neighbor match between a reference catalog and
+a prediction catalog.  By default it uses a 0.5 arcsec radius and a 0.168
+arcsec/pixel scale, matching the HSC cutouts used in this experiment.  Optional
+diagnostic outputs include FP/FN/GT CSV files, per-source stamps, and parent-mask
+overlays for debugging mismatches.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -25,6 +34,8 @@ DEFAULT_RADIUS_ARCSEC = 0.5
 
 @dataclass(frozen=True)
 class SourcePoints:
+    """Filtered source positions plus their original table indices."""
+
     ids: np.ndarray
     x: np.ndarray
     y: np.ndarray
@@ -48,6 +59,7 @@ def _resolve_prediction_path(path: Path) -> Path:
 
 
 def _choose_position_columns(table: Table, x_col: str | None, y_col: str | None, *, role: str) -> tuple[str, str]:
+    """Pick centroid columns, preferring SDSS centroids and then deblend peaks."""
     if x_col is not None or y_col is not None:
         if x_col is None or y_col is None:
             raise ValueError(f"pass both --{role}-x and --{role}-y, or neither")
@@ -136,6 +148,12 @@ def _load_points(
 
 
 def match_nearest_unique(ref: SourcePoints, pred: SourcePoints, radius_pix: float) -> tuple[list[dict], np.ndarray, np.ndarray]:
+    """Return greedy one-to-one centroid matches within ``radius_pix``.
+
+    Candidate pairs are sorted by distance, so the closest remaining pair is
+    kept first.  The returned masks are in filtered SourcePoints order and are
+    later used for recall/completeness and precision/purity accounting.
+    """
     if ref.n == 0 or pred.n == 0:
         return [], np.zeros(ref.n, dtype=bool), np.zeros(pred.n, dtype=bool)
 

@@ -1,3 +1,12 @@
+"""Crop LSST catalog tables to the same parent-patch box as an image cutout.
+
+The coadd FITS files in this project use parent-patch pixel coordinates encoded
+by LTV1/LTV2.  This utility keeps catalog rows whose centroid or peak positions
+fall in a requested box, adds local cutout coordinates, and preserves all other
+table columns.  It is mainly used to build reference catalogs for 512x512
+experiments.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -65,6 +74,7 @@ def infer_shape_from_exposure(path: Path, *, hdu: str | int = "IMAGE") -> tuple[
 
 
 def cutout_box_from_exposure(path: Path, *, hdu: str | int = "IMAGE") -> CutoutBox:
+    """Infer x0/y0/width/height from an LSST Exposure FITS IMAGE HDU."""
     x0, y0 = infer_parent_origin_from_exposure(path, hdu=hdu)
     width, height = infer_shape_from_exposure(path, hdu=hdu)
     return CutoutBox(float(x0), float(y0), float(width), float(height))
@@ -123,6 +133,7 @@ def crop_meas_catalog(
     y_col: str = DEFAULT_MEAS_Y,
     margin: float = 0.0,
 ) -> Table:
+    """Crop a meas catalog by source centroid columns."""
     table = read_meas_sources(path)
     return crop_table_by_position(
         table,
@@ -142,6 +153,7 @@ def crop_det_peak_catalog(
     y_col: str = DEFAULT_DET_PEAK_Y,
     margin: float = 0.0,
 ) -> Table:
+    """Crop a detection peak catalog by peak-position columns."""
     table = read_det_peaks(path)
     return crop_table_by_position(
         table,

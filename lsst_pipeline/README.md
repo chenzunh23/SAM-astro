@@ -214,6 +214,138 @@ python convert_outputs_to_viewable_fits.py \
 这个脚本会把 LSST catalog 中的 footprint 画成普通二维 image FITS。此类输出适合用
 DS9/FIJI 检查 mask 区域。
 
+## Utils 工具脚本
+
+`utils/` 下的脚本用于准备 cutout、裁剪星表、做 centroid-match 评测，以及批量运行
+512x512 网格实验。建议在 `lsst_pipeline/` 目录下运行这些命令。
+
+### 裁剪官方星表到 cutout
+
+`utils/crop_lsst_catalog.py` 会按父 patch 像素坐标裁剪 LSST catalog。最稳妥的方式是
+用 cutout exposure 的 `IMAGE` HDU 自动推断 `x0/y0/width/height`：
+
+```bash
+python utils/crop_lsst_catalog.py \
+  /home/chenzunhao/2026-05-01_scarlet_deblend_demo/catalog/meas-HSC-I-9813-4,5.fits \
+  --kind meas \
+  --exposure fits/projection_cutout/HSC-I/deepCoadd-HSC-I-9813-4,5.fits \
+  --output fits/catalog/meas-HSC-I-9813-4,5.fits
+```
+
+也可以手动指定父 patch 坐标：
+
+```bash
+python utils/crop_lsst_catalog.py \
+  /home/chenzunhao/2026-05-01_scarlet_deblend_demo/catalog/meas-HSC-I-9813-4,5.fits \
+  --kind meas \
+  --x0 18204 --y0 20924 --width 512 --height 512 \
+  --output fits/catalog/meas-HSC-I-9813-4,5.fits
+```
+
+默认 `meas` 位置列是 `base_SdssCentroid_x/y`。输出表会保留原始列，并额外写入
+`centroid_local_x/y`，方便和 512x512 cutout 图像坐标对齐。
+
+### 生成结构自洽的 denoised cutout
+
+`utils/make_lsst_denoised_cutout_from_template.py` 用 noisy/template cutout 定义目标天区，
+从 denoised 大 FITS 中裁剪同一块区域。默认 `--structure-source denoised` 会保留 denoised
+大 FITS 的 HDU/archive 结构，并同步裁剪 `IMAGE`、`MASK`、`VARIANCE`：
+
+```bash
+python utils/make_lsst_denoised_cutout_from_template.py \
+  --template fits/projection_cutout/HSC-I/deepCoadd-HSC-I-9813-4,5.fits \
+  --denoised fits/denoised_full/HSC-I/deepCoadd-HSC-I-9813-4,5.fits \
+  --output fits/denoised_cutout/HSC-I/deepCoadd-HSC-I-9813-4,5.fits
+```
+
+通常不需要手动传 `--x0/--y0`；脚本会根据 template 和 denoised FITS 的 `LTV1/LTV2`
+自动推断 denoised 大图中的局部裁剪原点。
+
+### 单次 centroid match 评测
+
+`utils/evaluate_centroid_matches.py` 用参考星表和预测 catalog 做一对一最近邻匹配。默认
+匹配半径是 `0.5 arcsec`，像素尺度是 `0.168 arcsec/pixel`，即约 `2.976 pixel`。
+
+```bash
+python utils/evaluate_centroid_matches.py \
+  --reference fits/catalog/meas-HSC-I-9813-4,5.fits \
+  --prediction output/sam_run \
+  --background fits/projection_cutout/HSC-I/deepCoadd-HSC-I-9813-4,5.fits \
+  --output output/sam_run/centroid_metrics.json \
+  --matches-csv output/sam_run/centroid_matches.csv \
+  --diagnostic-dir output/sam_run/centroid_diagnostics
+```
+
+`--prediction` 可以是 `deblend/deepCoadd_deblendedFlux.fits`，也可以是包含该文件的 run
+输出目录。默认只统计 leaf source，且会过滤 sky source、空 `deblend_modelType` 记录和
+flagged centroid。诊断目录会输出 FP/FN/GT CSV 和可选 PNG stamps。
+
+### 512x512 网格实验和按星等评测
+
+`utils/run_cutout_magnitude_experiment.py` 会自动生成 8x7 个 512x512 cutout，包含之前常用
+的 anchor origin `18204,20924`，分别运行 LSST/SAM pipeline，并按星等绘制
+completeness/purity 曲线和计数直方图。LSST 使用 CPU 并行；SAM 可按 GPU 并行。
+
+```bash
+python utils/run_cutout_magnitude_experiment.py \
+  --coadd-root fits/projection_cutout \
+  --reference-catalog /home/chenzunhao/2026-05-01_scarlet_deblend_demo/catalog/meas-HSC-I-9813-4,5.fits \
+  --output-root output/cutout_magnitude_experiment_grid \
+  --methods lsst sam \
+  --lsst-workers 8 \
+  --sam-gpus 0,1,2 \
+  --sam-workers-per-gpu 1 \
+  --bin-size 0.5 \
+  --continue-on-error
+```
+
+如果已经跑完 pipeline，只想重算 CSV 和图：
+
+```bash
+python utils/run_cutout_magnitude_experiment.py \
+  --coadd-root fits/projection_cutout \
+  --reference-catalog /home/chenzunhao/2026-05-01_scarlet_deblend_demo/catalog/meas-HSC-I-9813-4,5.fits \
+  --output-root output/cutout_magnitude_experiment_grid \
+  --methods lsst sam \
+  --bin-size 0.5 \
+  --continue-on-error \
+  --plot-only
+```
+
+默认星等显示范围是 `18 <= mag < 30`。小于 18 和大于等于 30 的源会分别进入 `<18` 和
+`>=30` 溢出 bin，不会把横轴拉到 70 等假源。`>=30` 的 FP 高峰会写入
+`prediction_fp_detail_bins`，并标注在 purity stacked bar 图上。
+
+重要输出：
+
+- `grid_metadata.json`
+  - 实际生成的 cutout origin、网格大小、anchor 信息。
+- `magnitude_evaluation_metadata.json`
+  - 候选 cutout 数、实际评估 cutout 数、被跳过的不完整 cutout 列表。
+- `magnitude_metrics_per_cutout.csv`
+  - 每个 cutout、每个方法、每个星等 bin 的原始统计。
+- `magnitude_metrics_aggregate.csv`
+  - 聚合后的曲线和直方图数据。
+- `magnitude_curves.png`
+  - completeness 和 purity 曲线，横轴按星等从小到大。
+- `magnitude_completeness_counts.png`
+  - 星表源数和 TP 数的直方图，横轴使用 catalog magnitude。
+- `magnitude_purity_fp_counts.png`
+  - prediction magnitude 下的 TP/FP stacked bar，不混入星表源数。
+
+为了公平比较，默认只统计所有 requested methods 都产出
+`deblend/deepCoadd_deblendedFlux.fits` 的 cutout。如果某块 LSST 失败但 SAM 成功，该块
+会整体跳过，星表也不会计入。需要旧的“各方法独立统计”行为时再加：
+
+```bash
+--allow-incomplete-cutouts
+```
+
+注意：purity 的星等 bin 使用预测源 flux，默认来自 scarlet source spectrum
+`scarlet_spectrum_i`；completeness 的星等 bin 使用参考星表 flux，默认
+`base_PsfFlux_instFlux`。两者横轴同名为 magnitude，但 flux 定义不同，不能直接比较峰值
+所在 bin。
+
 ## parent、child 和 science leaf
 
 - merge 后的一个连通 footprint 是一个 parent blend 区域。

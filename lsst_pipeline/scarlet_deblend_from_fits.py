@@ -587,7 +587,7 @@ def run_demo(
         # In lsst-scipipe-10.1.0, combinedGrow=False enters a Python loop over
         # FootprintSet, but that binding is not iterable.  Use no grow here:
         # it also avoids reconnecting nearby detections on denoised cutouts.
-        # lsst_config.detection.nSigmaToGrow = 0.5 # Default 2.4
+        lsst_config.detection.nSigmaToGrow = 0.0 # Default 2.4
         # lsst_config.detection.returnOriginalFootprints = True
 
         for band_name, exposure_path in coadds:

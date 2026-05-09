@@ -1,11 +1,24 @@
+"""Run and evaluate a grid of LSST/SAM deblend experiments.
+
+The script prepares 512x512 coadd cutouts, optionally runs the LSST-native and
+SAM-detection pipelines, crops the reference meas catalog to the same cutouts,
+and computes centroid-match completeness/purity by magnitude.  It can also run
+in ``--plot-only`` mode to recompute CSV summaries and figures from existing
+pipeline outputs.
+"""
+
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
+import os
+import pickle
 import shlex
 import subprocess
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +29,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from astropy.io import fits
 from astropy.table import Table
+from astropy.utils.exceptions import AstropyWarning
 
 THIS_DIR = Path(__file__).resolve().parent
 PIPELINE_ROOT = THIS_DIR.parent
@@ -31,13 +45,15 @@ from evaluate_centroid_matches import (  # noqa: E402
 )
 
 
-BANDS = ("HSC-G", "HSC-R", "HSC-I")
+BANDS =  ("HSC-I", "HSC-R", "HSC-G") # ("HSC-G", "HSC-R", "HSC-I")
 PIXEL_PLANES = ("IMAGE", "MASK", "VARIANCE")
 DEFAULT_PREVIOUS_ORIGIN = (18204, 20924)
 
 
 @dataclass(frozen=True)
 class CutoutSpec:
+    """One square cutout defined in parent-patch pixel coordinates."""
+
     name: str
     x0: int
     y0: int
@@ -141,6 +157,9 @@ def make_cutouts(args: argparse.Namespace, specs: list[CutoutSpec]) -> dict[str,
         for band in BANDS:
             src = _coadd_path(args.coadd_root, band, args.tract, args.patch)
             dst = args.output_root / "cutouts" / spec.name / band / src.name
+            if args.dry_run:
+                cutout_paths[band] = dst
+                continue
             if not dst.exists() or not args.skip_existing:
                 crop_exposure_cutout(
                     source_path=src,
@@ -161,6 +180,7 @@ def _run_pipeline(
     method: str,
     spec: CutoutSpec,
     cutout_paths: dict[str, Path],
+    env_update: dict[str, str] | None = None,
 ) -> Path:
     outdir = args.output_root / "runs" / spec.name / method
     manifest = outdir / "manifest.json"
@@ -192,17 +212,71 @@ def _run_pipeline(
     outdir.parent.mkdir(parents=True, exist_ok=True)
     log_path = outdir.with_suffix(f".{method}.log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    print("running:", " ".join(shlex.quote(str(part)) for part in cmd))
+    env = os.environ.copy()
+    if env_update:
+        env.update(env_update)
+    label = f"{method} {spec.name}"
+    if env_update and "CUDA_VISIBLE_DEVICES" in env_update:
+        label += f" gpu={env_update['CUDA_VISIBLE_DEVICES']}"
+    print(f"running {label}:", " ".join(shlex.quote(str(part)) for part in cmd))
     if args.dry_run:
         return outdir
     with log_path.open("w") as log:
-        proc = subprocess.run(cmd, cwd=args.pipeline_root, stdout=log, stderr=subprocess.STDOUT)
+        proc = subprocess.run(cmd, cwd=args.pipeline_root, stdout=log, stderr=subprocess.STDOUT, env=env)
     if proc.returncode != 0:
         if args.continue_on_error:
             print(f"WARNING: {method} {spec.name} failed; see {log_path}")
             return outdir
         raise RuntimeError(f"{method} {spec.name} failed with exit code {proc.returncode}; see {log_path}")
     return outdir
+
+
+def _submit_runs(
+    *,
+    args: argparse.Namespace,
+    method: str,
+    specs: list[CutoutSpec],
+    cutouts: dict[str, dict[str, Path]],
+) -> None:
+    """Run one method over all cutouts with method-appropriate parallelism."""
+    if method == "lsst":
+        max_workers = max(1, int(args.lsst_workers))
+        env_update = {
+            "OMP_NUM_THREADS": str(args.lsst_threads_per_worker),
+            "OPENBLAS_NUM_THREADS": str(args.lsst_threads_per_worker),
+            "MKL_NUM_THREADS": str(args.lsst_threads_per_worker),
+            "NUMEXPR_NUM_THREADS": str(args.lsst_threads_per_worker),
+        }
+
+        def task(spec: CutoutSpec) -> Path:
+            return _run_pipeline(args=args, method=method, spec=spec, cutout_paths=cutouts[spec.name], env_update=env_update)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(task, spec) for spec in specs]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+        return
+
+    if method == "sam":
+        gpus = [gpu.strip() for gpu in args.sam_gpus.split(",") if gpu.strip()]
+        if not gpus:
+            gpus = ["0"]
+        slots = [gpu for gpu in gpus for _ in range(max(1, int(args.sam_workers_per_gpu)))]
+        max_workers = len(slots)
+
+        def task(item: tuple[int, CutoutSpec]) -> Path:
+            index, spec = item
+            gpu = slots[index % len(slots)]
+            env_update = {"CUDA_VISIBLE_DEVICES": gpu}
+            return _run_pipeline(args=args, method=method, spec=spec, cutout_paths=cutouts[spec.name], env_update=env_update)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(task, item) for item in enumerate(specs)]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+        return
+
+    raise ValueError(f"unknown method: {method}")
 
 
 def crop_reference_catalog(args: argparse.Namespace, spec: CutoutSpec) -> Path:
@@ -231,14 +305,178 @@ def _flux_to_mag(flux: np.ndarray, zeropoint: float) -> np.ndarray:
 
 def _choose_flux_col(table: Table, preferred: str, fallbacks: tuple[str, ...]) -> str:
     for name in (preferred, *fallbacks):
+        if name in {"", "auto", "none", "None"}:
+            continue
         if name in table.colnames:
             return name
     raise KeyError(f"none of the flux columns exists: {(preferred, *fallbacks)}")
 
 
+def _band_to_spectrum_label(band: str) -> str:
+    label = band.strip()
+    if label.startswith("HSC-"):
+        label = label.split("-", 1)[1]
+    return label.lower()
+
+
+def _source_spectrum_from_csv(run_dir: Path, pred_points, *, band: str) -> np.ndarray | None:
+    csv_path = run_dir / "vis" / "source_panels" / "source_spectra.csv"
+    if not csv_path.exists():
+        return None
+    spectrum_col = f"spectrum_{_band_to_spectrum_label(band)}"
+    by_id: dict[int, float] = {}
+    with csv_path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None or spectrum_col not in reader.fieldnames:
+            return None
+        for row in reader:
+            try:
+                by_id[int(row["source_id"])] = float(row[spectrum_col])
+            except (KeyError, TypeError, ValueError):
+                continue
+    flux = np.full(pred_points.n, np.nan, dtype=float)
+    for i, source_id in enumerate(pred_points.ids):
+        if int(source_id) in by_id:
+            flux[i] = by_id[int(source_id)]
+    return flux
+
+
+def _source_spectrum_from_model(run_dir: Path, pred_points, *, band: str) -> np.ndarray | None:
+    pickle_path = run_dir / "deblend" / "deepCoadd_scarletModelData.pickle"
+    if not pickle_path.exists():
+        return None
+    with pickle_path.open("rb") as handle:
+        try:
+            model_data = pickle.load(handle)
+        except ModuleNotFoundError as exc:
+            print(f"WARNING: cannot read scarlet model pickle without module {exc.name!r}: {pickle_path}")
+            return None
+    if not getattr(model_data, "blends", None):
+        return None
+
+    first_blend = next(iter(model_data.blends.values()))
+    bands = [str(value).lower() for value in getattr(first_blend, "bands", [])]
+    band_label = _band_to_spectrum_label(band)
+    if band_label not in bands:
+        return None
+    band_index = bands.index(band_label)
+
+    by_id: dict[int, float] = {}
+    for blend in model_data.blends.values():
+        for source_id, source in blend.sources.items():
+            total = 0.0
+            for component in getattr(source, "factorized_components", []):
+                spectrum = np.asarray(component.spectrum, dtype=float)
+                if band_index < spectrum.size and np.isfinite(spectrum[band_index]):
+                    total += float(spectrum[band_index])
+            by_id[int(source_id)] = total
+
+    flux = np.full(pred_points.n, np.nan, dtype=float)
+    for i, source_id in enumerate(pred_points.ids):
+        if int(source_id) in by_id:
+            flux[i] = by_id[int(source_id)]
+    return flux
+
+
+def _source_spectrum_flux_for_binning(run_dir: Path, pred_points, *, band: str) -> np.ndarray | None:
+    """Load scarlet source-spectrum fluxes aligned to prediction source ids."""
+    flux = _source_spectrum_from_csv(run_dir, pred_points, band=band)
+    if flux is not None and np.count_nonzero(np.isfinite(flux) & (flux > 0)) > 0:
+        return flux
+    flux = _source_spectrum_from_model(run_dir, pred_points, band=band)
+    if flux is not None and np.count_nonzero(np.isfinite(flux) & (flux > 0)) > 0:
+        return flux
+    return None
+
+
+def _prediction_flux_for_binning(
+    *,
+    args: argparse.Namespace,
+    run_dir: Path,
+    pred_points,
+) -> tuple[np.ndarray, str]:
+    if args.pred_flux_col in {"", "auto", "source_spectrum"}:
+        flux = _source_spectrum_flux_for_binning(run_dir, pred_points, band=args.pred_spectrum_band)
+        if flux is not None:
+            return flux, f"scarlet_spectrum_{_band_to_spectrum_label(args.pred_spectrum_band)}"
+
+    candidate_cols = []
+    if args.pred_flux_col not in {"", "auto", "none", "None"}:
+        candidate_cols.append(args.pred_flux_col)
+    candidate_cols.extend(["deblend_scarletFlux", "deblend_peak_instFlux"])
+    for col in candidate_cols:
+        if col not in pred_points.table.colnames:
+            continue
+        flux = np.asarray(pred_points.table[col], dtype=float)[pred_points.table_indices]
+        if np.count_nonzero(np.isfinite(flux) & (flux > 0)) > 0:
+            return flux, col
+
+    return np.full(pred_points.n, np.nan, dtype=float), "unavailable"
+
+
+def _mag_bin_mask(mag: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    mask = np.isfinite(mag)
+    if np.isfinite(lo):
+        mask &= mag >= lo
+    if np.isfinite(hi):
+        mask &= mag < hi
+    return mask
+
+
+def _magnitude_bins(mag_min: float, mag_max: float, bin_size: float) -> list[tuple[float, float, float]]:
+    """Return underflow, regular, and overflow magnitude bins.
+
+    The displayed range is fixed by mag_min/mag_max.  Values outside that range
+    are kept in the first/last bins instead of stretching plots to extreme
+    outliers such as very faint SAM false positives.
+    """
+    bins: list[tuple[float, float, float]] = []
+    bins.append((-np.inf, mag_min, mag_min - 0.5 * bin_size))
+    edges = np.arange(mag_min, mag_max + bin_size * 0.5, bin_size)
+    bins.extend((float(lo), float(hi), float(0.5 * (lo + hi))) for lo, hi in zip(edges[:-1], edges[1:]))
+    bins.append((mag_max, np.inf, mag_max + 0.5 * bin_size))
+    return bins
+
+
+def _format_count_bins(counts: dict[float, int], *, bin_size: float, top_n: int) -> str:
+    if not counts:
+        return ""
+    items = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:top_n]
+    return "; ".join(f"{lo:g}-{lo + bin_size:g}:{count}" for lo, count in items)
+
+
+def _parse_count_bins(value: str) -> dict[float, int]:
+    counts: dict[float, int] = {}
+    if not value:
+        return counts
+    for part in str(value).split(";"):
+        part = part.strip()
+        if not part or ":" not in part or "-" not in part:
+            continue
+        label, count_text = part.rsplit(":", 1)
+        lo_text = label.split("-", 1)[0]
+        try:
+            counts[float(lo_text)] = counts.get(float(lo_text), 0) + int(count_text)
+        except ValueError:
+            continue
+    return counts
+
+
+def _fp_detail_bins(pred_mag: np.ndarray, pred_used: np.ndarray, row_mask: np.ndarray, *, bin_size: float, top_n: int) -> str:
+    fp_mag = pred_mag[row_mask & ~pred_used & np.isfinite(pred_mag)]
+    if fp_mag.size == 0:
+        return ""
+    bucket_left = np.floor(fp_mag / bin_size) * bin_size
+    counts: dict[float, int] = {}
+    for lo in bucket_left:
+        counts[float(lo)] = counts.get(float(lo), 0) + 1
+    return _format_count_bins(counts, bin_size=bin_size, top_n=top_n)
+
+
 def _rows_for_bins(
     *,
     cutout: str,
+    run_dir: Path,
     method: str,
     ref_points,
     pred_points,
@@ -246,18 +484,19 @@ def _rows_for_bins(
     pred_used: np.ndarray,
     args: argparse.Namespace,
 ) -> list[dict]:
+    """Compute per-cutout completeness and purity rows for magnitude bins.
+
+    Reference magnitudes come from the cropped catalog.  Prediction magnitudes
+    come from scarlet source spectra when available, so purity is binned by the
+    deblend model flux rather than by catalog flux.
+    """
     ref_flux_col = _choose_flux_col(
         ref_points.table,
         args.ref_flux_col,
         ("modelfit_CModel_instFlux", "base_PsfFlux_instFlux", "base_SdssShape_instFlux"),
     )
-    pred_flux_col = _choose_flux_col(
-        pred_points.table,
-        args.pred_flux_col,
-        ("deblend_scarletFlux", "deblend_peak_instFlux"),
-    )
     ref_flux = np.asarray(ref_points.table[ref_flux_col], dtype=float)[ref_points.table_indices]
-    pred_flux = np.asarray(pred_points.table[pred_flux_col], dtype=float)[pred_points.table_indices]
+    pred_flux, pred_flux_col = _prediction_flux_for_binning(args=args, run_dir=run_dir, pred_points=pred_points)
     ref_mag = _flux_to_mag(ref_flux, args.mag_zero_point)
     pred_mag = _flux_to_mag(pred_flux, args.mag_zero_point)
 
@@ -266,23 +505,32 @@ def _rows_for_bins(
         return []
     mag_min = float(args.mag_min) if args.mag_min is not None else np.floor(np.nanmin(finite) / args.bin_size) * args.bin_size
     mag_max = float(args.mag_max) if args.mag_max is not None else np.ceil(np.nanmax(finite) / args.bin_size) * args.bin_size
-    edges = np.arange(mag_min, mag_max + args.bin_size * 0.5, args.bin_size)
+    bins = _magnitude_bins(mag_min, mag_max, float(args.bin_size))
 
     rows = []
-    for lo, hi in zip(edges[:-1], edges[1:]):
-        ref_in = np.isfinite(ref_mag) & (ref_mag >= lo) & (ref_mag < hi)
-        pred_in = np.isfinite(pred_mag) & (pred_mag >= lo) & (pred_mag < hi)
+    for lo, hi, center in bins:
+        ref_in = _mag_bin_mask(ref_mag, lo, hi)
+        pred_in = _mag_bin_mask(pred_mag, lo, hi)
         ref_total = int(np.count_nonzero(ref_in))
         pred_total = int(np.count_nonzero(pred_in))
         ref_matched = int(np.count_nonzero(ref_in & ref_used))
         pred_matched = int(np.count_nonzero(pred_in & pred_used))
+        fp_detail = ""
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            fp_detail = _fp_detail_bins(
+                pred_mag,
+                pred_used,
+                pred_in,
+                bin_size=float(args.fp_detail_bin_size),
+                top_n=int(args.fp_detail_top_n),
+            )
         rows.append(
             {
                 "cutout": cutout,
                 "method": method,
                 "mag_left": float(lo),
                 "mag_right": float(hi),
-                "mag_center": float(0.5 * (lo + hi)),
+                "mag_center": float(center),
                 "reference_flux_col": ref_flux_col,
                 "prediction_flux_col": pred_flux_col,
                 "reference_total": ref_total,
@@ -291,6 +539,7 @@ def _rows_for_bins(
                 "prediction_total": pred_total,
                 "prediction_matched": pred_matched,
                 "purity": pred_matched / pred_total if pred_total else np.nan,
+                "prediction_fp_detail_bins": fp_detail,
             }
         )
     return rows
@@ -338,6 +587,7 @@ def evaluate_run(args: argparse.Namespace, *, spec: CutoutSpec, method: str, run
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     return _rows_for_bins(
         cutout=spec.name,
+        run_dir=run_dir,
         method=method,
         ref_points=ref_points,
         pred_points=pred_points,
@@ -345,6 +595,10 @@ def evaluate_run(args: argparse.Namespace, *, spec: CutoutSpec, method: str, run
         pred_used=pred_used,
         args=args,
     )
+
+
+def _prediction_catalog_path(args: argparse.Namespace, spec: CutoutSpec, method: str) -> Path:
+    return args.output_root / "runs" / spec.name / method / "deblend" / "deepCoadd_deblendedFlux.fits"
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
@@ -363,6 +617,7 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         "prediction_total",
         "prediction_matched",
         "purity",
+        "prediction_fp_detail_bins",
     ]
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -371,6 +626,7 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 
 
 def aggregate_rows(rows: list[dict]) -> list[dict]:
+    """Sum per-cutout rows into method-level magnitude-bin totals."""
     grouped: dict[tuple[str, float, float], dict] = {}
     for row in rows:
         key = (row["method"], row["mag_left"], row["mag_right"])
@@ -385,21 +641,29 @@ def aggregate_rows(rows: list[dict]) -> list[dict]:
                 "reference_matched": 0,
                 "prediction_total": 0,
                 "prediction_matched": 0,
+                "_prediction_fp_detail_counts": {},
             },
         )
         item["reference_total"] += int(row["reference_total"])
         item["reference_matched"] += int(row["reference_matched"])
         item["prediction_total"] += int(row["prediction_total"])
         item["prediction_matched"] += int(row["prediction_matched"])
+        for lo, count in _parse_count_bins(row.get("prediction_fp_detail_bins", "")).items():
+            detail_counts = item["_prediction_fp_detail_counts"]
+            detail_counts[lo] = detail_counts.get(lo, 0) + count
     out = []
     for item in grouped.values():
         ref_total = item["reference_total"]
         pred_total = item["prediction_total"]
         item["completeness"] = item["reference_matched"] / ref_total if ref_total else np.nan
         item["purity"] = item["prediction_matched"] / pred_total if pred_total else np.nan
+        item["prediction_fp_detail_bins"] = _format_count_bins(
+            item.pop("_prediction_fp_detail_counts"),
+            bin_size=1.0,
+            top_n=5,
+        )
         out.append(item)
     return sorted(out, key=lambda r: (r["method"], r["mag_left"]))
-
 
 def plot_curves(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -408,8 +672,18 @@ def plot_curves(path: Path, rows: list[dict]) -> None:
     for method in methods:
         method_rows = [row for row in rows if row["method"] == method]
         x = np.array([row["mag_center"] for row in method_rows], dtype=float)
+        # Only consider bins in [23, 30] for plotting, to avoid noisy extremes with very few sources.
+        mask = (x >= 23) & (x <= 30)
+        x = x[mask]
         completeness = np.array([row["completeness"] for row in method_rows], dtype=float)
+        completeness = completeness[mask]
         purity = np.array([row["purity"] for row in method_rows], dtype=float)
+        purity = purity[mask]
+        # Keep the line order and displayed x-axis in increasing magnitude.
+        order = np.argsort(x)
+        x = x[order]
+        completeness = completeness[order]
+        purity = purity[order]
         axes[0].plot(x, completeness, marker="o", linewidth=1.8, label=method)
         axes[1].plot(x, purity, marker="o", linewidth=1.8, label=method)
     for ax, title in zip(axes, ("Completeness by catalog magnitude", "Purity by deblend magnitude")):
@@ -417,7 +691,6 @@ def plot_curves(path: Path, rows: list[dict]) -> None:
         ax.set_xlabel("instrumental magnitude")
         ax.set_ylabel("score")
         ax.set_ylim(-0.03, 1.03)
-        ax.invert_xaxis()
         ax.grid(alpha=0.25)
         ax.spines[["top", "right"]].set_visible(False)
     if methods:
@@ -426,9 +699,217 @@ def plot_curves(path: Path, rows: list[dict]) -> None:
     plt.close(fig)
 
 
+def _ordered_methods(rows: list[dict]) -> list[str]:
+    methods = sorted({str(row["method"]) for row in rows})
+    preferred = [name for name in ("lsst", "sam") if name in methods]
+    return preferred + [name for name in methods if name not in preferred]
+
+
+def _mag_bin_label(lo: float, hi: float) -> str:
+    if not np.isfinite(lo):
+        return f"<{hi:g}"
+    if not np.isfinite(hi):
+        return f">={lo:g}"
+    return f"{lo:g}-{hi:g}"
+
+
+def plot_count_histograms(completeness_path: Path, purity_path: Path, rows: list[dict]) -> None:
+    """Write count histograms used to audit the curve metrics.
+
+    The completeness histogram compares catalog counts with TP counts by catalog
+    magnitude.  The purity histogram is a stacked TP+FP bar chart by prediction
+    magnitude and deliberately omits catalog counts because the x-axis uses a
+    different flux definition.
+    """
+    completeness_path.parent.mkdir(parents=True, exist_ok=True)
+    purity_path.parent.mkdir(parents=True, exist_ok=True)
+    methods = _ordered_methods(rows)
+    bins = sorted({(float(row["mag_left"]), float(row["mag_right"]), float(row["mag_center"])) for row in rows})
+    if not bins or not methods:
+        return
+
+    by_method_bin = {
+        (str(row["method"]), float(row["mag_left"]), float(row["mag_right"])): row
+        for row in rows
+    }
+    reference_by_bin = []
+    for lo, hi, _ in bins:
+        candidates = [
+            int(row["reference_total"])
+            for row in rows
+            if float(row["mag_left"]) == lo and float(row["mag_right"]) == hi
+        ]
+        reference_by_bin.append(max(candidates) if candidates else 0)
+
+    x = np.arange(len(bins), dtype=float)
+    labels = [_mag_bin_label(lo, hi) for lo, hi, _ in bins]
+    width = min(0.28, 0.75 / max(1, len(methods)))
+    offsets = (np.arange(len(methods)) - (len(methods) - 1) / 2.0) * width
+    figsize = (max(11.0, 0.48 * len(bins)), 5.2)
+
+    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+    ax.bar(x, reference_by_bin, width=0.86, color="0.82", edgecolor="0.55", linewidth=0.6, label="catalog sources")
+    for offset, method in zip(offsets, methods):
+        tp = [
+            int(by_method_bin.get((method, lo, hi), {}).get("reference_matched", 0))
+            for lo, hi, _ in bins
+        ]
+        ax.bar(x + offset, tp, width=width, label=f"{method.upper()} TP")
+    ax.set_title("Catalog sources and matched true positives by catalog magnitude")
+    ax.set_xlabel("catalog instrumental magnitude bin")
+    ax.set_ylabel("source count")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.grid(axis="y", alpha=0.25)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(frameon=False, ncols=min(3, len(methods) + 1))
+    fig.savefig(completeness_path, dpi=180)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+    overflow_notes = []
+    for offset, method in zip(offsets, methods):
+        tp = [
+            int(by_method_bin.get((method, lo, hi), {}).get("prediction_matched", 0))
+            for lo, hi, _ in bins
+        ]
+        fp = [
+            max(
+                0,
+                int(by_method_bin.get((method, lo, hi), {}).get("prediction_total", 0))
+                - int(by_method_bin.get((method, lo, hi), {}).get("prediction_matched", 0)),
+            )
+            for lo, hi, _ in bins
+        ]
+        ax.bar(x + offset, tp, width=width, label=f"{method.upper()} TP")
+        ax.bar(x + offset, fp, width=width, bottom=tp, label=f"{method.upper()} FP")
+        for lo, hi, _ in bins:
+            if np.isfinite(hi):
+                continue
+            detail = by_method_bin.get((method, lo, hi), {}).get("prediction_fp_detail_bins", "")
+            if detail:
+                overflow_notes.append(f"{method.upper()} >= {lo:g} FP peaks: {detail}")
+    ax.set_title("Predicted sources by deblend magnitude")
+    ax.set_xlabel("predicted instrumental magnitude bin")
+    ax.set_ylabel("source count")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.grid(axis="y", alpha=0.25)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(frameon=False, ncols=min(3, len(methods) + 1))
+    if overflow_notes:
+        ax.text(
+            0.99,
+            0.98,
+            "\n".join(overflow_notes),
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=7,
+            bbox={"facecolor": "white", "alpha": 0.82, "edgecolor": "0.75", "linewidth": 0.6, "pad": 3},
+        )
+    fig.savefig(purity_path, dpi=180)
+    plt.close(fig)
+
+
+def _image_bounds(coadd_root: Path, *, tract: int, patch: str, band: str = "HSC-I") -> tuple[int, int, int, int]:
+    path = _coadd_path(coadd_root, band, tract, patch)
+    with fits.open(path, memmap=False) as hdul:
+        data = hdul["IMAGE"].data
+        if data is None or data.ndim != 2:
+            raise ValueError(f"{path}[IMAGE] is not a 2D image")
+        x0, y0 = _origin_from_ltv(hdul["IMAGE"].header)
+        height, width = data.shape
+    return int(x0), int(y0), int(width), int(height)
+
+
+def _anchored_axis_origins(
+    *,
+    start: int,
+    length: int,
+    tile: int,
+    count: int,
+    anchor: int,
+) -> tuple[list[int], str]:
+    max_origin = start + length - tile
+    if count <= 0:
+        return [], "empty"
+    if length < tile:
+        raise ValueError(f"axis length {length} is smaller than tile size {tile}")
+    if count * tile > length:
+        raise ValueError(f"axis cannot fit {count} non-edge tiles of size {tile} into length {length}")
+    if not (start <= anchor <= max_origin):
+        raise ValueError(f"anchor {anchor} is outside valid origin range {start}:{max_origin}")
+
+    candidate_regular = []
+    for anchor_index in range(count):
+        first = anchor - anchor_index * tile
+        last = first + (count - 1) * tile
+        if start <= first and last <= max_origin:
+            candidate_regular.append((abs(anchor_index - (count - 1) / 2), first))
+    if candidate_regular:
+        _, first = min(candidate_regular)
+        return [first + i * tile for i in range(count)], "regular_anchor_aligned"
+
+    origins = [start + i * tile for i in range(count)]
+    replace_index = min(range(count), key=lambda i: abs(origins[i] - anchor))
+    replaced = origins[replace_index]
+    origins[replace_index] = anchor
+    origins = sorted(set(origins))
+    if len(origins) != count:
+        for value in [start + i * tile for i in range(length // tile)]:
+            if value not in origins and start <= value <= max_origin:
+                origins.append(value)
+            if len(origins) == count:
+                break
+    origins = sorted(origins)
+    if len(origins) != count:
+        raise RuntimeError(f"could not generate {count} valid origins including anchor {anchor}")
+    return origins, f"nonuniform_anchor_inserted_replaced_{replaced}"
+
+
+def generate_grid_specs(args: argparse.Namespace) -> tuple[list[CutoutSpec], dict]:
+    image_x0, image_y0, width, height = _image_bounds(args.coadd_root, tract=args.tract, patch=args.patch)
+    anchor_x, anchor_y = [int(float(v)) for v in args.grid_anchor.split(",", 1)]
+    x_origins, x_mode = _anchored_axis_origins(
+        start=image_x0,
+        length=width,
+        tile=args.size,
+        count=args.grid_cols,
+        anchor=anchor_x,
+    )
+    y_origins, y_mode = _anchored_axis_origins(
+        start=image_y0,
+        length=height,
+        tile=args.size,
+        count=args.grid_rows,
+        anchor=anchor_y,
+    )
+    specs = [
+        CutoutSpec(name=f"grid_r{row:02d}_c{col:02d}_x{x0}_y{y0}", x0=x0, y0=y0, size=args.size)
+        for row, y0 in enumerate(y_origins)
+        for col, x0 in enumerate(x_origins)
+    ]
+    metadata = {
+        "image_origin": [image_x0, image_y0],
+        "image_shape": [width, height],
+        "tile_size": args.size,
+        "grid_cols": args.grid_cols,
+        "grid_rows": args.grid_rows,
+        "grid_count": len(specs),
+        "grid_anchor": [anchor_x, anchor_y],
+        "x_origins": x_origins,
+        "y_origins": y_origins,
+        "x_generation_mode": x_mode,
+        "y_generation_mode": y_mode,
+        "contains_anchor_origin": any(spec.x0 == anchor_x and spec.y0 == anchor_y for spec in specs),
+    }
+    if not metadata["contains_anchor_origin"]:
+        raise RuntimeError(f"generated grid does not contain anchor origin {anchor_x},{anchor_y}")
+    return specs, metadata
+
+
 def parse_origins(values: list[str], *, size: int) -> list[CutoutSpec]:
-    if not values:
-        values = [f"{DEFAULT_PREVIOUS_ORIGIN[0]},{DEFAULT_PREVIOUS_ORIGIN[1]}"]
     specs = []
     seen = set()
     for index, value in enumerate(values, start=1):
@@ -444,7 +925,31 @@ def parse_origins(values: list[str], *, size: int) -> list[CutoutSpec]:
     return specs
 
 
+def build_specs(args: argparse.Namespace) -> tuple[list[CutoutSpec], dict]:
+    if args.origin:
+        specs = parse_origins(args.origin, size=args.size)
+        try:
+            grid_specs, _ = generate_grid_specs(args)
+            grid_names = {(spec.x0, spec.y0): spec.name for spec in grid_specs}
+            specs = [
+                CutoutSpec(name=grid_names.get((spec.x0, spec.y0), spec.name), x0=spec.x0, y0=spec.y0, size=spec.size)
+                for spec in specs
+            ]
+        except Exception:
+            pass
+        metadata = {
+            "mode": "manual",
+            "grid_count": len(specs),
+            "origins": [[spec.x0, spec.y0] for spec in specs],
+        }
+        return specs, metadata
+    specs, metadata = generate_grid_specs(args)
+    metadata["mode"] = "grid"
+    return specs, metadata
+
+
 def main() -> None:
+    warnings.filterwarnings("ignore", category=AstropyWarning)
     parser = argparse.ArgumentParser(
         description=(
             "Run LSST/SAM deblend experiments on 512x512 cutouts from a large coadd, "
@@ -461,12 +966,24 @@ def main() -> None:
     parser.add_argument("--tract", type=int, default=9813)
     parser.add_argument("--patch", default="4,5")
     parser.add_argument("--size", type=int, default=512)
-    parser.add_argument("--origin", action="append", default=[], help="Parent-patch origin x,y. Defaults to previous x=18204,y=20924.")
+    parser.add_argument("--origin", action="append", default=[], help="Manual parent-patch origin x,y. If omitted, run the automatic grid.")
+    parser.add_argument("--grid-cols", type=int, default=8)
+    parser.add_argument("--grid-rows", type=int, default=7)
+    parser.add_argument("--grid-anchor", default=f"{DEFAULT_PREVIOUS_ORIGIN[0]},{DEFAULT_PREVIOUS_ORIGIN[1]}")
     parser.add_argument("--methods", nargs="+", default=["lsst", "sam"], choices=["lsst", "sam"])
+    parser.add_argument("--lsst-workers", type=int, default=max(1, min(4, (os.cpu_count() or 4) // 2)))
+    parser.add_argument("--lsst-threads-per-worker", type=int, default=1)
+    parser.add_argument("--sam-gpus", default=os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
+    parser.add_argument("--sam-workers-per-gpu", type=int, default=2)
     parser.add_argument("--lsst-extra-args", default="", help="Extra args appended only to LSST runs, shell-style string.")
     parser.add_argument("--sam-extra-args", default="", help="Extra args appended only to SAM runs, shell-style string.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--plot-only", action="store_true", help="Do not crop or run pipelines; evaluate existing outputs.")
+    parser.add_argument(
+        "--allow-incomplete-cutouts",
+        action="store_true",
+        help="Evaluate each method independently even when another requested method is missing for the same cutout.",
+    )
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--no-clean-nonfinite", action="store_true")
@@ -476,11 +993,22 @@ def main() -> None:
     parser.add_argument("--pred-x", default=None)
     parser.add_argument("--pred-y", default=None)
     parser.add_argument("--ref-flux-col", default="base_PsfFlux_instFlux")
-    parser.add_argument("--pred-flux-col", default="deblend_scarletFlux")
+    parser.add_argument(
+        "--pred-flux-col",
+        default="auto",
+        help=(
+            "Prediction flux column for purity binning. Default auto uses the "
+            "scarlet source spectrum from source_spectra.csv or model_data pickle, "
+            "then falls back to positive finite deblend flux columns."
+        ),
+    )
+    parser.add_argument("--pred-spectrum-band", default="HSC-I", choices=list(BANDS))
     parser.add_argument("--mag-zero-point", type=float, default=27.0)
     parser.add_argument("--bin-size", type=float, default=1.0)
-    parser.add_argument("--mag-min", type=float, default=None)
-    parser.add_argument("--mag-max", type=float, default=None)
+    parser.add_argument("--mag-min", type=float, default=18.0, help="Lower displayed magnitude edge; values below this go into a single underflow bin.")
+    parser.add_argument("--mag-max", type=float, default=30.0, help="Upper displayed magnitude edge; values at or above this go into a single overflow bin.")
+    parser.add_argument("--fp-detail-bin-size", type=float, default=1.0)
+    parser.add_argument("--fp-detail-top-n", type=int, default=5)
     parser.add_argument("--match-radius-arcsec", type=float, default=DEFAULT_RADIUS_ARCSEC)
     parser.add_argument("--pixel-scale", type=float, default=DEFAULT_PIXEL_SCALE)
     args = parser.parse_args()
@@ -492,15 +1020,42 @@ def main() -> None:
     args.pipeline_root = args.pipeline_root.expanduser().resolve()
     args.pipeline_script = args.pipeline_script.expanduser().resolve()
 
-    specs = parse_origins(args.origin, size=args.size)
+    specs, grid_metadata = build_specs(args)
+    args.output_root.mkdir(parents=True, exist_ok=True)
+    grid_metadata_path = args.output_root / "grid_metadata.json"
+    grid_metadata_path.write_text(json.dumps(grid_metadata, indent=2, sort_keys=True) + "\n")
+    print(f"prepared {len(specs)} cutouts; wrote {grid_metadata_path}")
+
     if not args.plot_only:
         cutouts = make_cutouts(args, specs)
-        for spec in specs:
-            for method in args.methods:
-                _run_pipeline(args=args, method=method, spec=spec, cutout_paths=cutouts[spec.name])
+        for method in args.methods:
+            _submit_runs(args=args, method=method, specs=specs, cutouts=cutouts)
+        if args.dry_run:
+            print("dry-run complete; no cutouts, pipeline outputs, or metrics were written beyond grid metadata.")
+            return
 
     all_rows = []
+    skipped_cutouts = []
     for spec in specs:
+        missing_methods = [
+            method
+            for method in args.methods
+            if not _prediction_catalog_path(args, spec, method).exists()
+        ]
+        if missing_methods and not args.allow_incomplete_cutouts:
+            skipped_cutouts.append(
+                {
+                    "cutout": spec.name,
+                    "origin": [spec.x0, spec.y0],
+                    "missing_methods": missing_methods,
+                }
+            )
+            print(
+                "WARNING: skipping incomplete cutout "
+                f"{spec.name}; missing prediction catalog for {','.join(missing_methods)}"
+            )
+            continue
+
         ref_catalog = crop_reference_catalog(args, spec)
         for method in args.methods:
             run_dir = args.output_root / "runs" / spec.name / method
@@ -509,14 +1064,35 @@ def main() -> None:
     per_cutout_csv = args.output_root / "magnitude_metrics_per_cutout.csv"
     aggregate_csv = args.output_root / "magnitude_metrics_aggregate.csv"
     plot_path = args.output_root / "magnitude_curves.png"
+    completeness_counts_path = args.output_root / "magnitude_completeness_counts.png"
+    purity_fp_counts_path = args.output_root / "magnitude_purity_fp_counts.png"
+    evaluation_metadata_path = args.output_root / "magnitude_evaluation_metadata.json"
     write_csv(per_cutout_csv, all_rows)
     aggregate = aggregate_rows(all_rows)
     write_csv(aggregate_csv, aggregate)
     plot_curves(plot_path, aggregate)
+    plot_count_histograms(completeness_counts_path, purity_fp_counts_path, aggregate)
+    evaluation_metadata_path.write_text(
+        json.dumps(
+            {
+                "candidate_cutout_count": len(specs),
+                "evaluated_cutout_count": len(specs) - len(skipped_cutouts),
+                "skipped_cutout_count": len(skipped_cutouts),
+                "allow_incomplete_cutouts": bool(args.allow_incomplete_cutouts),
+                "skipped_cutouts": skipped_cutouts,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
 
     print(f"wrote {per_cutout_csv}")
     print(f"wrote {aggregate_csv}")
     print(f"wrote {plot_path}")
+    print(f"wrote {completeness_counts_path}")
+    print(f"wrote {purity_fp_counts_path}")
+    print(f"wrote {evaluation_metadata_path}")
 
 
 if __name__ == "__main__":

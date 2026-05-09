@@ -1,3 +1,11 @@
+"""Build a self-consistent denoised LSST Exposure cutout.
+
+The template cutout supplies the desired sky footprint and output size.  The
+denoised full-patch FITS supplies the pixel planes and, by default, the full HDU
+archive structure.  IMAGE, MASK, and VARIANCE are cropped together and WCS/LTV
+metadata are shifted so the resulting FITS can be consumed by the LSST pipeline.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -25,6 +33,7 @@ def _finite_replacement(values: np.ndarray) -> float:
 
 
 def _cropped_header(header: fits.Header, *, x0: int, y0: int) -> fits.Header:
+    """Shift pixel-coordinate header keywords after a local crop."""
     out = header.copy()
     if "LTV1" in out:
         out["LTV1"] = float(out["LTV1"]) - x0
@@ -60,6 +69,12 @@ def make_cutout(
     clean_nonfinite: bool,
     structure_source: str,
 ) -> None:
+    """Write a denoised cutout whose pixel planes and headers agree.
+
+    ``x0``/``y0`` are local pixel origins in the denoised full image.  If omitted,
+    they are inferred from the difference between the template and denoised LTV
+    origins, which is the common case for matching a known noisy cutout.
+    """
     with fits.open(template_path, memmap=False) as template_hdul, fits.open(denoised_path, memmap=False) as den_hdul:
         if "IMAGE" not in template_hdul:
             raise KeyError(f"{template_path} has no IMAGE extension")

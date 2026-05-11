@@ -110,6 +110,78 @@ def _catalog_summary(catalog) -> dict[str, int]:
     }
 
 
+def _run_measurement_stage(
+    *,
+    deblended_catalog,
+    scarlet_model_data,
+    exposures_by_label: dict[str, Any],
+    band_label_by_name: dict[str, str],
+    ordered_band_names: list[str],
+    sky_info,
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Run per-band coadd measurement on scarlet deblended sources."""
+    import lsst.afw.table as afwTable
+    from lsst.meas.extensions.scarlet.io import updateCatalogFootprints
+    from lsst.pipe.tasks.multiBand import MeasureMergedCoaddSourcesTask
+
+    measure_root = output_dir / "measure"
+    measure_root.mkdir(parents=True, exist_ok=True)
+
+    measure_config = MeasureMergedCoaddSourcesTask.ConfigClass()
+    measure_config.doAddFootprints = True
+    measure_config.doConserveFlux = True
+    measure_config.doPropagateFlags = False
+    measure_config.checkUnitsParseStrict = "warn"
+    measure_task = MeasureMergedCoaddSourcesTask(
+        config=measure_config,
+        initInputs={"inputSchema": deblended_catalog},
+    )
+
+    outputs: dict[str, Any] = {}
+    for band_name in ordered_band_names:
+        band_label = band_label_by_name[band_name]
+        exposure = exposures_by_label[band_label]
+        try:
+            exposure.getPsf().setCacheCapacity(measure_config.psfCache)
+        except Exception:
+            pass
+
+        table = afwTable.SourceTable.make(
+            measure_task.schema,
+            afwTable.IdFactory.makeSimple(),
+        )
+        sources = afwTable.SourceCatalog(table)
+        sources.extend(deblended_catalog, measure_task.schemaMapper)
+
+        updateCatalogFootprints(
+            modelData=scarlet_model_data,
+            catalog=sources,
+            band=band_label,
+            imageForRedistribution=exposure,
+            removeScarletData=False,
+            updateFluxColumns=True,
+        )
+        result = measure_task.run(
+            exposure=exposure,
+            sources=sources,
+            skyInfo=sky_info,
+            exposureId=_stable_int("measure", band_name),
+        )
+
+        band_root = measure_root / band_name
+        band_root.mkdir(parents=True, exist_ok=True)
+        meas_fits = band_root / "deepCoadd_meas.fits"
+        result.outputSources.writeFits(str(meas_fits))
+        outputs[band_name] = {
+            "band_label": band_label,
+            "meas_fits": str(meas_fits),
+            "summary": _catalog_summary(result.outputSources),
+        }
+
+    return outputs
+
+
 def _get_exposure_image_array(exposure):
     image = exposure.image if hasattr(exposure, "image") else exposure.getImage()
     return image.array
@@ -587,7 +659,7 @@ def run_demo(
         # In lsst-scipipe-10.1.0, combinedGrow=False enters a Python loop over
         # FootprintSet, but that binding is not iterable.  Use no grow here:
         # it also avoids reconnecting nearby detections on denoised cutouts.
-        lsst_config.detection.nSigmaToGrow = 0.0 # Default 2.4
+        # lsst_config.detection.nSigmaToGrow = 0.0 # Default 2.4
         # lsst_config.detection.returnOriginalFootprints = True
 
         for band_name, exposure_path in coadds:
@@ -676,6 +748,15 @@ def run_demo(
     scarlet_model_zip = deblend_root / "deepCoadd_scarletModelData.zip"
     deblend_result.deblendedCatalog.writeFits(str(deblended_fits))
     scarlet_model_manifest = _persist_scarlet_model(scarlet_model_zip, deblend_result.scarletModelData)
+    measure_outputs = _run_measurement_stage(
+        deblended_catalog=deblend_result.deblendedCatalog,
+        scarlet_model_data=deblend_result.scarletModelData,
+        exposures_by_label=detect_exposures_by_label,
+        band_label_by_name=band_label_by_name,
+        ordered_band_names=[band_name for band_name, _ in coadds],
+        sky_info=sky_info,
+        output_dir=output_dir,
+    )
 
     manifest = {
         "inputs": {
@@ -700,6 +781,7 @@ def run_demo(
             **scarlet_model_manifest,
             "summary": _catalog_summary(deblend_result.deblendedCatalog),
         },
+        "measure": measure_outputs,
     }
     _write_json(output_dir / "manifest.json", manifest)
     return manifest

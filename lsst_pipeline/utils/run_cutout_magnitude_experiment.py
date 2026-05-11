@@ -45,7 +45,7 @@ from evaluate_centroid_matches import (  # noqa: E402
 )
 
 
-BANDS =  ("HSC-I", "HSC-R", "HSC-G") # ("HSC-G", "HSC-R", "HSC-I")
+BANDS = ("HSC-I", "HSC-R", "HSC-G")    #   ("HSC-G", "HSC-R", "HSC-I")
 PIXEL_PLANES = ("IMAGE", "MASK", "VARIANCE")
 DEFAULT_PREVIOUS_ORIGIN = (18204, 20924)
 
@@ -395,7 +395,7 @@ def _prediction_flux_for_binning(
     run_dir: Path,
     pred_points,
 ) -> tuple[np.ndarray, str]:
-    if args.pred_flux_col in {"", "auto", "source_spectrum"}:
+    if args.pred_flux_col == "source_spectrum":
         flux = _source_spectrum_flux_for_binning(run_dir, pred_points, band=args.pred_spectrum_band)
         if flux is not None:
             return flux, f"scarlet_spectrum_{_band_to_spectrum_label(args.pred_spectrum_band)}"
@@ -403,7 +403,16 @@ def _prediction_flux_for_binning(
     candidate_cols = []
     if args.pred_flux_col not in {"", "auto", "none", "None"}:
         candidate_cols.append(args.pred_flux_col)
-    candidate_cols.extend(["deblend_scarletFlux", "deblend_peak_instFlux"])
+    else:
+        candidate_cols.extend(
+            [
+                "base_PsfFlux_instFlux",
+                "base_GaussianFlux_instFlux",
+                "base_SdssShape_instFlux",
+                "deblend_scarletFlux",
+                "deblend_peak_instFlux",
+            ]
+        )
     for col in candidate_cols:
         if col not in pred_points.table.colnames:
             continue
@@ -486,9 +495,9 @@ def _rows_for_bins(
 ) -> list[dict]:
     """Compute per-cutout completeness and purity rows for magnitude bins.
 
-    Reference magnitudes come from the cropped catalog.  Prediction magnitudes
-    come from scarlet source spectra when available, so purity is binned by the
-    deblend model flux rather than by catalog flux.
+    Reference magnitudes come from the cropped catalog. Prediction magnitudes
+    come from the measured prediction catalog when available, so purity is
+    binned by the same post-measurement flux used for source comparison.
     """
     ref_flux_col = _choose_flux_col(
         ref_points.table,
@@ -498,7 +507,7 @@ def _rows_for_bins(
     ref_flux = np.asarray(ref_points.table[ref_flux_col], dtype=float)[ref_points.table_indices]
     pred_flux, pred_flux_col = _prediction_flux_for_binning(args=args, run_dir=run_dir, pred_points=pred_points)
     ref_mag = _flux_to_mag(ref_flux, args.mag_zero_point)
-    pred_mag = _flux_to_mag(pred_flux, args.mag_zero_point)
+    pred_mag = _flux_to_mag(pred_flux, args.pred_mag_zero_point)
 
     finite = np.concatenate([ref_mag[np.isfinite(ref_mag)], pred_mag[np.isfinite(pred_mag)]])
     if finite.size == 0:
@@ -546,7 +555,7 @@ def _rows_for_bins(
 
 
 def evaluate_run(args: argparse.Namespace, *, spec: CutoutSpec, method: str, run_dir: Path, ref_catalog: Path) -> list[dict]:
-    pred_catalog = run_dir / "deblend" / "deepCoadd_deblendedFlux.fits"
+    pred_catalog = _prediction_catalog_path(args, spec, method)
     if not pred_catalog.exists():
         print(f"WARNING: missing prediction catalog: {pred_catalog}")
         return []
@@ -598,7 +607,11 @@ def evaluate_run(args: argparse.Namespace, *, spec: CutoutSpec, method: str, run
 
 
 def _prediction_catalog_path(args: argparse.Namespace, spec: CutoutSpec, method: str) -> Path:
-    return args.output_root / "runs" / spec.name / method / "deblend" / "deepCoadd_deblendedFlux.fits"
+    run_dir = args.output_root / "runs" / spec.name / method
+    meas_catalog = run_dir / "measure" / args.pred_spectrum_band / "deepCoadd_meas.fits"
+    if meas_catalog.exists():
+        return meas_catalog
+    return run_dir / "deblend" / "deepCoadd_deblendedFlux.fits"
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
@@ -998,12 +1011,14 @@ def main() -> None:
         default="auto",
         help=(
             "Prediction flux column for purity binning. Default auto uses the "
-            "scarlet source spectrum from source_spectra.csv or model_data pickle, "
-            "then falls back to positive finite deblend flux columns."
+            "post-measurement base_PsfFlux_instFlux from measure/<band>/deepCoadd_meas.fits "
+            "when available, then falls back to other positive finite measured/deblend flux columns. "
+            "Use 'source_spectrum' only to reproduce the old scarlet-spectrum binning."
         ),
     )
     parser.add_argument("--pred-spectrum-band", default="HSC-I", choices=list(BANDS))
     parser.add_argument("--mag-zero-point", type=float, default=27.0)
+    parser.add_argument("--pred-mag-zero-point", type=float, default=31.4)
     parser.add_argument("--bin-size", type=float, default=1.0)
     parser.add_argument("--mag-min", type=float, default=18.0, help="Lower displayed magnitude edge; values below this go into a single underflow bin.")
     parser.add_argument("--mag-max", type=float, default=30.0, help="Upper displayed magnitude edge; values at or above this go into a single overflow bin.")

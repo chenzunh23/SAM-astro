@@ -9,6 +9,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from pipeline_catalog_filters import (
+    DEFAULT_DEBLEND_HARD_FAILURE_FLAGS,
+    DEFAULT_MEASUREMENT_FLUX_COLUMN,
+    catalog_summary as _catalog_summary,
+    filter_deblend_hard_failures,
+    filter_measurement_failures,
+    measurement_failure_flags,
+)
+
 
 def _parse_band_arg(value: str) -> tuple[str, Path]:
     if "=" not in value:
@@ -89,27 +98,6 @@ def _filter_band_label(exposure) -> str:
     return str(band_label)
 
 
-def _catalog_summary(catalog) -> dict[str, int]:
-    parent = catalog["parent"] if "parent" in catalog.schema else []
-    if len(parent) == 0:
-        return {"row_count": int(len(catalog)), "parent_zero_count": 0,"child_count": 0}
-
-    is_sky = []
-    for record in catalog:
-        try:
-            is_sky.append(bool(record["merge_footprint_sky"]))
-        except Exception:
-            is_sky.append(False)
-
-    science = [not v for v in is_sky]
-    return {
-        "row_count": int(sum(science)),
-        "sky_count": int(sum(is_sky)),
-        "parent_zero_count": int(sum(int(p) == 0 and keep for p, keep in zip(parent,science))),
-        "child_count": int(sum(int(p) != 0 and keep for p, keep in zip(parent,science))),
-    }
-
-
 def _run_measurement_stage(
     *,
     deblended_catalog,
@@ -119,6 +107,10 @@ def _run_measurement_stage(
     ordered_band_names: list[str],
     sky_info,
     output_dir: Path,
+    measurement_filter: str,
+    measurement_failure_flag_names: list[str] | tuple[str, ...],
+    measurement_flux_column: str,
+    measurement_require_positive_flux: bool,
 ) -> dict[str, Any]:
     """Run per-band coadd measurement on scarlet deblended sources."""
     import lsst.afw.table as afwTable
@@ -172,11 +164,33 @@ def _run_measurement_stage(
         band_root = measure_root / band_name
         band_root.mkdir(parents=True, exist_ok=True)
         meas_fits = band_root / "deepCoadd_meas.fits"
-        result.outputSources.writeFits(str(meas_fits))
+        raw_meas_fits = band_root / "deepCoadd_meas_raw.fits"
+        output_sources = result.outputSources
+        raw_summary = _catalog_summary(output_sources)
+        filter_summary: dict[str, Any] = {
+            "enabled": False,
+            "policy": "none",
+            "input_rows": int(len(output_sources)),
+            "output_rows": int(len(output_sources)),
+            "removed_rows": 0,
+        }
+        if measurement_filter != "none":
+            output_sources.writeFits(str(raw_meas_fits))
+            output_sources, filter_summary = filter_measurement_failures(
+                output_sources,
+                policy=measurement_filter,
+                failure_flags=measurement_failure_flag_names,
+                flux_column=measurement_flux_column,
+                require_positive_flux=measurement_require_positive_flux,
+            )
+        output_sources.writeFits(str(meas_fits))
         outputs[band_name] = {
             "band_label": band_label,
             "meas_fits": str(meas_fits),
-            "summary": _catalog_summary(result.outputSources),
+            "raw_meas_fits": str(raw_meas_fits) if measurement_filter != "none" else None,
+            "raw_summary": raw_summary,
+            "filter": filter_summary,
+            "summary": _catalog_summary(output_sources),
         }
 
     return outputs
@@ -624,6 +638,12 @@ def run_demo(
     clip_sky_sources_to_exposure_bbox: bool,
     detection_mode: str,
     sam_config: dict[str, Any],
+    deblend_filter: str,
+    deblend_hard_failure_flags: list[str] | tuple[str, ...],
+    measurement_filter: str,
+    measurement_failure_flag_names: list[str] | tuple[str, ...],
+    measurement_flux_column: str,
+    measurement_require_positive_flux: bool,
 ) -> dict[str, Any]:
     try:
         import lsst.afw.image as afwImage
@@ -745,17 +765,40 @@ def run_demo(
         idFactory=afwTable.IdFactory.makeSimple(),
     )
     deblended_fits = deblend_root / "deepCoadd_deblendedFlux.fits"
+    raw_deblended_fits = deblend_root / "deepCoadd_deblendedFlux_raw.fits"
     scarlet_model_zip = deblend_root / "deepCoadd_scarletModelData.zip"
-    deblend_result.deblendedCatalog.writeFits(str(deblended_fits))
+    deblended_catalog = deblend_result.deblendedCatalog
+    raw_deblend_summary = _catalog_summary(deblended_catalog)
+    deblend_filter_summary: dict[str, Any] = {
+        "enabled": False,
+        "policy": "none",
+        "input_rows": int(len(deblended_catalog)),
+        "output_rows": int(len(deblended_catalog)),
+        "removed_rows": 0,
+    }
+    if deblend_filter == "hard":
+        deblended_catalog.writeFits(str(raw_deblended_fits))
+        deblended_catalog, deblend_filter_summary = filter_deblend_hard_failures(
+            deblended_catalog,
+            hard_failure_flags=deblend_hard_failure_flags,
+        )
+    elif deblend_filter != "none":
+        raise RuntimeError(f"unknown deblend filter policy: {deblend_filter}")
+
+    deblended_catalog.writeFits(str(deblended_fits))
     scarlet_model_manifest = _persist_scarlet_model(scarlet_model_zip, deblend_result.scarletModelData)
     measure_outputs = _run_measurement_stage(
-        deblended_catalog=deblend_result.deblendedCatalog,
+        deblended_catalog=deblended_catalog,
         scarlet_model_data=deblend_result.scarletModelData,
         exposures_by_label=detect_exposures_by_label,
         band_label_by_name=band_label_by_name,
         ordered_band_names=[band_name for band_name, _ in coadds],
         sky_info=sky_info,
         output_dir=output_dir,
+        measurement_filter=measurement_filter,
+        measurement_failure_flag_names=measurement_failure_flag_names,
+        measurement_flux_column=measurement_flux_column,
+        measurement_require_positive_flux=measurement_require_positive_flux,
     )
 
     manifest = {
@@ -778,8 +821,11 @@ def run_demo(
         },
         "deblend": {
             "deblended_catalog_fits": str(deblended_fits),
+            "raw_deblended_catalog_fits": str(raw_deblended_fits) if deblend_filter == "hard" else None,
             **scarlet_model_manifest,
-            "summary": _catalog_summary(deblend_result.deblendedCatalog),
+            "raw_summary": raw_deblend_summary,
+            "filter": deblend_filter_summary,
+            "summary": _catalog_summary(deblended_catalog),
         },
         "measure": measure_outputs,
     }
@@ -812,6 +858,53 @@ def main() -> int:
         choices=["lsst", "sam"],
         default="lsst",
         help="Use official LSST DetectCoaddSourcesTask or SAM-generated footprints before LSST merge/deblend.",
+    )
+    parser.add_argument(
+        "--deblend-filter",
+        choices=["none", "hard"],
+        default="none",
+        help=(
+            "Optional post-scarlet deblend catalog filter before measurement. "
+            "'hard' removes rows with hard deblend failure flags and descendants of failed parents."
+        ),
+    )
+    parser.add_argument(
+        "--deblend-hard-failure-flags",
+        nargs="+",
+        default=list(DEFAULT_DEBLEND_HARD_FAILURE_FLAGS),
+        help=(
+            "Flag fields removed when --deblend-filter hard is enabled. "
+            "Defaults to the scarlet deblend hard-failure flags."
+        ),
+    )
+    parser.add_argument(
+        "--measurement-filter",
+        choices=["none", "basic", "strict"],
+        default="none",
+        help=(
+            "Optional post-measurement source filter. 'basic' removes clearly invalid "
+            "leaf-source measurements; 'strict' also removes shape/blendedness/clipped-center failures."
+        ),
+    )
+    parser.add_argument(
+        "--measurement-filter-flags",
+        nargs="+",
+        default=None,
+        help=(
+            "Override the flag fields removed by --measurement-filter basic/strict. "
+            "Only applies when --measurement-filter is not none."
+        ),
+    )
+    parser.add_argument(
+        "--measurement-flux-column",
+        default=DEFAULT_MEASUREMENT_FLUX_COLUMN,
+        help="Flux field used for finite/positive measurement filtering.",
+    )
+    parser.add_argument(
+        "--measurement-require-positive-flux",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require --measurement-flux-column to be finite and positive when measurement filtering is enabled.",
     )
     parser.add_argument(
         "--sam-repo",
@@ -886,6 +979,7 @@ def main() -> int:
         "high_percentile": float(args.sam_high_percentile),
     }
 
+    measurement_flags = measurement_failure_flags(args.measurement_filter, args.measurement_filter_flags)
     manifest = run_demo(
         coadds=args.coadd,
         repo=args.repo.expanduser(),
@@ -895,6 +989,12 @@ def main() -> int:
         clip_sky_sources_to_exposure_bbox=bool(args.clip_sky_sources_to_exposure_bbox),
         detection_mode=args.detection_mode,
         sam_config=sam_config,
+        deblend_filter=args.deblend_filter,
+        deblend_hard_failure_flags=list(args.deblend_hard_failure_flags),
+        measurement_filter=args.measurement_filter,
+        measurement_failure_flag_names=measurement_flags,
+        measurement_flux_column=str(args.measurement_flux_column),
+        measurement_require_positive_flux=bool(args.measurement_require_positive_flux),
     )
     print(json.dumps(manifest, indent=2, sort_keys=True))
     return 0

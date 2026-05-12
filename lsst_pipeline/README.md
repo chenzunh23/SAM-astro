@@ -84,6 +84,98 @@ SAM 相关默认参数已经按当前实验设置写入脚本，主要包括：
 当前 SAM 模式会对每个 SAM mask 在科学 coadd 图像上寻找多个 peak，然后把这些 peak
 写入 LSST footprint。这样一个 SAM 区域可以在 scarlet deblend 中分出多个 child source。
 
+## 可选：过滤 scarlet hard-failure 源
+
+默认情况下，pipeline 会保留 scarlet deblend 的完整输出。若要在 measurement 前去掉
+scarlet 明确标记为不可用的源，可加入：
+
+```bash
+--deblend-filter hard
+```
+
+启用后，脚本会先保存未过滤表：
+
+```text
+deblend/deepCoadd_deblendedFlux_raw.fits
+```
+
+然后把过滤后的表继续写到原路径：
+
+```text
+deblend/deepCoadd_deblendedFlux.fits
+```
+
+默认 hard-failure flag 为：
+
+```text
+deblend_failed
+deblend_skipped
+deblend_tooManyPeaks
+deblend_parentTooBig
+deblend_masked
+deblend_incompleteData
+deblend_zeroFlux
+```
+
+如果失败的是 parent，会同时移除它的 child；如果某个 parent 的 child 全部被移除，
+该 parent 也会被移除。过滤统计写入 `manifest.json` 的 `deblend.filter` 字段。
+
+可用自定义 flag 列表覆盖默认值：
+
+```bash
+--deblend-filter hard \
+--deblend-hard-failure-flags deblend_failed deblend_skipped deblend_zeroFlux
+```
+
+## 可选：过滤 measurement 失败源
+
+默认情况下，measurement 表也会完整保留。若要在每个波段的 measurement 后删除明显不合理
+的 leaf source，可加入：
+
+```bash
+--measurement-filter basic
+```
+
+启用后，每个波段会保存：
+
+```text
+measure/HSC-I/deepCoadd_meas_raw.fits  # 未过滤 measurement 表
+measure/HSC-I/deepCoadd_meas.fits      # 过滤后表，供后续评测默认读取
+```
+
+`basic` 会删除 sky source、无效质心、非有限或非正 `base_PsfFlux_instFlux`，以及这些
+明显失败 flag 对应的 leaf source：
+
+```text
+base_PsfFlux_flag
+base_PsfFlux_flag_noGoodPixels
+base_PsfFlux_flag_edge
+base_SdssCentroid_flag
+base_PixelFlags_flag_edge
+base_PixelFlags_flag_bad
+base_PixelFlags_flag_saturatedCenter
+base_PixelFlags_flag_interpolatedCenter
+base_PixelFlags_flag_crCenter
+```
+
+`strict` 在 `basic` 基础上再删除：
+
+```text
+base_SdssShape_flag
+base_PixelFlags_flag_clippedCenter
+base_Blendedness_flag_noCentroid
+base_Blendedness_flag_noShape
+```
+
+注意：`strict` 在某些实验中会非常激进，应同时查看 `manifest.json` 中
+`measure.<band>.filter` 的删源数量。也可以自定义 flag：
+
+```bash
+--measurement-filter basic \
+--measurement-filter-flags base_PsfFlux_flag base_SdssCentroid_flag \
+--measurement-flux-column base_PsfFlux_instFlux
+```
+
 常用调节参数：
 
 - `--sam-detection-scope multiband`

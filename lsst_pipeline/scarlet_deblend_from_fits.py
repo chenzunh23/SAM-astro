@@ -658,7 +658,7 @@ def run_demo(
             "first (for example: source /opt/lsst/software/stack/loadLSST.bash && setup lsst_distrib)."
         ) from exc
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_oks=True)
     sky_info = _load_sky_info(repo=repo, tract=tract, patch=patch)
 
     if detection_mode == "sam":

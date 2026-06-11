@@ -51,3 +51,6 @@ testing*/
 
 # FITS
 lsst_pipeline/fits/
+
+# Outputs
+output/

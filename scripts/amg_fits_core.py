@@ -15,6 +15,7 @@ import numpy as np
 try:
     from astropy.io import fits
     from astropy.stats import sigma_clipped_stats
+    from astropy.visualization import ZScaleInterval
 except Exception as exc:  # pragma: no cover
     raise RuntimeError("astropy is required. Install with: pip install astropy") from exc
 
@@ -209,6 +210,26 @@ def robust_to_uint8(image: np.ndarray, low_pct: float, high_pct: float) -> np.nd
     return np.round(np.clip(y, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
+def zscale_to_uint8(image: np.ndarray, low_pct: float, high_pct: float) -> np.ndarray:
+    """Map a FITS-like image to uint8 using astropy's zscale interval."""
+
+    image = np.asarray(image, dtype=np.float32)
+    vals = finite_values(image)
+    try:
+        lo, hi = ZScaleInterval().get_limits(vals)
+    except Exception:
+        lo = float(np.percentile(vals, low_pct))
+        hi = float(np.percentile(vals, high_pct))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo = float(np.nanmin(vals))
+        hi = float(np.nanmax(vals))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return np.zeros_like(image, dtype=np.uint8)
+    y = (np.clip(image, lo, hi) - lo) / (hi - lo)
+    y = np.nan_to_num(y, nan=0.0, posinf=1.0, neginf=0.0)
+    return np.round(np.clip(y, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
 def lupton_to_uint8(image: np.ndarray, low_pct: float, high_pct: float, q: float = 10.0) -> np.ndarray:
     vals = finite_values(image)
     minimum = float(np.percentile(vals, low_pct))
@@ -324,8 +345,12 @@ def make_linear_rgb(r: np.ndarray, g: np.ndarray, b: np.ndarray, low_pct: float,
 
 
 def make_gray_quicklook_from_rgb(r: np.ndarray, g: np.ndarray, b: np.ndarray, low_pct: float, high_pct: float) -> np.ndarray:
-    rgb_float = make_linear_rgb(r, g, b, low_pct, high_pct)
-    gray = np.round(np.dot(rgb_float, RGB_WEIGHTS) * 255.0).astype(np.uint8)
+    gray_float = (
+        np.asarray(r, dtype=np.float32) * float(RGB_WEIGHTS[0])
+        + np.asarray(g, dtype=np.float32) * float(RGB_WEIGHTS[1])
+        + np.asarray(b, dtype=np.float32) * float(RGB_WEIGHTS[2])
+    )
+    gray = zscale_to_uint8(gray_float, low_pct, high_pct)
     return np.repeat(gray[..., None], 3, axis=2)
 
 
